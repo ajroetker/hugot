@@ -44,3 +44,5 @@ require (
 	gopkg.in/yaml.v3 v3.0.1 // indirect
 	k8s.io/klog/v2 v2.130.1 // indirect
 )
+
+replace github.com/knights-analytics/ortgenai => /Users/ajroetker/go/src/github.com/ajroetker/ortgenai

@@ -22,6 +22,7 @@ type Session struct {
 	textGenerationPipelines         pipelineMap[*pipelines.TextGenerationPipeline]
 	seq2seqPipelines                pipelineMap[*pipelines.Seq2SeqPipeline]
 	glinerPipelines                 pipelineMap[*pipelines.GLiNERPipeline]
+	vision2seqPipelines             pipelineMap[*pipelines.Vision2SeqPipeline]
 	models                          map[string]*backends.Model
 	options                         *options.Options
 	environmentDestroy              func() error
@@ -52,6 +53,7 @@ func newSession(backend string, opts ...options.WithOption) (*Session, error) {
 		textGenerationPipelines:         map[string]*pipelines.TextGenerationPipeline{},
 		seq2seqPipelines:                map[string]*pipelines.Seq2SeqPipeline{},
 		glinerPipelines:                 map[string]*pipelines.GLiNERPipeline{},
+		vision2seqPipelines:             map[string]*pipelines.Vision2SeqPipeline{},
 		models:                          map[string]*backends.Model{},
 		options:                         parsedOptions,
 		environmentDestroy: func() error {
@@ -132,6 +134,12 @@ type GLiNERConfig = backends.PipelineConfig[*pipelines.GLiNERPipeline]
 // GLiNEROption is an option for a GLiNER pipeline
 type GLiNEROption = backends.PipelineOption[*pipelines.GLiNERPipeline]
 
+// Vision2SeqConfig is the configuration for a vision-to-sequence (TrOCR, etc.) pipeline.
+type Vision2SeqConfig = backends.PipelineConfig[*pipelines.Vision2SeqPipeline]
+
+// Vision2SeqOption is an option for a vision-to-sequence pipeline.
+type Vision2SeqOption = backends.PipelineOption[*pipelines.Vision2SeqPipeline]
+
 // NewPipeline can be used to create a new pipeline of type T. The initialised pipeline will be returned and it
 // will also be stored in the session object so that all created pipelines can be destroyed with session.Destroy()
 // at once.
@@ -153,11 +161,12 @@ func NewPipeline[T backends.Pipeline](s *Session, pipelineConfig backends.Pipeli
 	var name string
 	var model *backends.Model
 
-	// Check if this is a Seq2SeqPipeline - it manages its own encoder/decoder models
+	// Check if this is a pipeline that manages its own encoder/decoder models
 	// and should not go through the standard model loading path
 	_, isSeq2Seq := any(pipeline).(*pipelines.Seq2SeqPipeline)
+	_, isVision2Seq := any(pipeline).(*pipelines.Vision2SeqPipeline)
 
-	if !isSeq2Seq {
+	if !isSeq2Seq && !isVision2Seq {
 		// Load model if it has not been loaded already (for non-Seq2Seq pipelines)
 		// Use combined ModelPath:OnnxFilename as key to allow multiple pipelines on same model path
 		modelID := pipelineConfig.ModelPath + ":" + pipelineConfig.OnnxFilename
@@ -199,6 +208,8 @@ func NewPipeline[T backends.Pipeline](s *Session, pipelineConfig backends.Pipeli
 		s.seq2seqPipelines[name] = typedPipeline
 	case *pipelines.GLiNERPipeline:
 		s.glinerPipelines[name] = typedPipeline
+	case *pipelines.Vision2SeqPipeline:
+		s.vision2seqPipelines[name] = typedPipeline
 	default:
 		return pipeline, fmt.Errorf("pipeline type not supported: %T", typedPipeline)
 	}
@@ -294,6 +305,18 @@ func InitializePipeline[T backends.Pipeline](p T, pipelineConfig backends.Pipeli
 		}
 		pipeline = any(pipelineInitialised).(T)
 		name = config.Name
+	case *pipelines.Vision2SeqPipeline:
+		// Vision2SeqPipeline is special: it loads its own encoder/decoder models
+		// The model parameter is ignored (passed as nil) since it manages its own models
+		config := any(pipelineConfig).(backends.PipelineConfig[*pipelines.Vision2SeqPipeline])
+		pipelineInitialised, err := pipelines.NewVision2SeqPipeline(config, options)
+		if err != nil {
+			return pipeline, name, err
+		}
+		pipeline = any(pipelineInitialised).(T)
+		name = config.Name
+		// Don't add to model.Pipelines since Vision2SeqPipeline manages its own models
+		return pipeline, name, nil
 	default:
 		return pipeline, name, fmt.Errorf("not implemented")
 	}
@@ -362,6 +385,12 @@ func GetPipeline[T backends.Pipeline](s *Session, name string) (T, error) {
 		return any(p).(T), nil
 	case *pipelines.GLiNERPipeline:
 		p, ok := s.glinerPipelines[name]
+		if !ok {
+			return pipeline, &pipelineNotFoundError{pipelineName: name}
+		}
+		return any(p).(T), nil
+	case *pipelines.Vision2SeqPipeline:
+		p, ok := s.vision2seqPipelines[name]
 		if !ok {
 			return pipeline, &pipelineNotFoundError{pipelineName: name}
 		}
@@ -480,6 +509,13 @@ func ClosePipeline[T backends.Pipeline](s *Session, name string) error {
 				return model.Destroy()
 			}
 		}
+	case *pipelines.Vision2SeqPipeline:
+		// Vision2SeqPipeline manages its own models, so we just destroy the pipeline
+		p, ok := s.vision2seqPipelines[name]
+		if ok {
+			delete(s.vision2seqPipelines, name)
+			return p.Destroy()
+		}
 	default:
 		return errors.New("pipeline type not supported")
 	}
@@ -511,6 +547,7 @@ func (s *Session) GetStatistics() map[string]backends.PipelineStatistics {
 	maps.Copy(statistics, s.textGenerationPipelines.GetStatistics())
 	maps.Copy(statistics, s.seq2seqPipelines.GetStatistics())
 	maps.Copy(statistics, s.glinerPipelines.GetStatistics())
+	maps.Copy(statistics, s.vision2seqPipelines.GetStatistics())
 	return statistics
 }
 
@@ -534,6 +571,10 @@ func (s *Session) Destroy() error {
 	for _, pipeline := range s.seq2seqPipelines {
 		err = errors.Join(err, pipeline.Destroy())
 	}
+	// Vision2SeqPipelines manage their own models, destroy them separately
+	for _, pipeline := range s.vision2seqPipelines {
+		err = errors.Join(err, pipeline.Destroy())
+	}
 	s.models = nil
 	s.featureExtractionPipelines = nil
 	s.tokenClassificationPipelines = nil
@@ -544,6 +585,7 @@ func (s *Session) Destroy() error {
 	s.crossEncoderPipelines = nil
 	s.seq2seqPipelines = nil
 	s.glinerPipelines = nil
+	s.vision2seqPipelines = nil
 
 	if s.options != nil {
 		err = errors.Join(err, s.options.Destroy())

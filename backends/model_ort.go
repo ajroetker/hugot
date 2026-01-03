@@ -262,6 +262,65 @@ func loadInputOutputMetaORT(onnxBytes []byte) ([]InputOutputInfo, []InputOutputI
 	return convertORTInputOutputs(inputs), convertORTInputOutputs(outputs), nil
 }
 
+// CreateORTModelBackendWithNames creates an ORT model backend with predefined input/output names.
+// This avoids the problematic metadata extraction which creates a temporary session
+// without our session options (e.g., disabled graph optimizations).
+// Use this for models where input/output names are known ahead of time.
+func CreateORTModelBackendWithNames(model *Model, opts *options.Options, inputNames, outputNames []string) error {
+	cwd, err := os.Getwd()
+	if err != nil {
+		return err
+	}
+	pathChanged := false
+	if !strings.HasPrefix(model.Path, "s3:") {
+		err = os.Chdir(model.Path)
+		if err != nil {
+			return err
+		}
+		pathChanged = true
+	}
+
+	sessionOptions := opts.BackendOptions.(*ort.SessionOptions)
+
+	session, errSession := ort.NewDynamicAdvancedSessionWithONNXData(
+		model.OnnxBytes,
+		inputNames,
+		outputNames,
+		sessionOptions,
+	)
+	if errSession != nil {
+		return errSession
+	}
+
+	// Build InputsMeta and OutputsMeta with just names (dimensions unknown but not needed for inference)
+	inputs := make([]InputOutputInfo, len(inputNames))
+	for i, name := range inputNames {
+		inputs[i] = InputOutputInfo{Name: name}
+	}
+	outputs := make([]InputOutputInfo, len(outputNames))
+	for i, name := range outputNames {
+		outputs[i] = InputOutputInfo{Name: name}
+	}
+
+	model.ORTModel = &ORTModel{
+		Session:        session,
+		SessionOptions: sessionOptions,
+		Options:        opts.ORTOptions,
+		Destroy: func() error {
+			return session.Destroy()
+		},
+	}
+	model.InputsMeta = inputs
+	model.OutputsMeta = outputs
+	if pathChanged {
+		err = os.Chdir(cwd)
+	}
+
+	// ONNX bytes no longer needed after creating the session
+	model.OnnxBytes = nil
+	return err
+}
+
 func createInputTensorsORT(batch *PipelineBatch, model *Model) error {
 	padLeft := len(model.EosTokenIDs) > 0
 	batchSize := batch.Size

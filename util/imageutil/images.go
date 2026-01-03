@@ -125,6 +125,21 @@ func RescaleStep() *RescalePreprocessor {
 	return &RescalePreprocessor{}
 }
 
+// ResizeToExactStep resizes an image to exact width and height dimensions.
+// Unlike ResizeStep which preserves aspect ratio, this resizes to the exact size.
+type ResizeToExactPreprocessor struct {
+	width  int
+	height int
+}
+
+func ResizeToExactStep(width, height int) *ResizeToExactPreprocessor {
+	return &ResizeToExactPreprocessor{width: width, height: height}
+}
+
+func (s *ResizeToExactPreprocessor) Apply(img image.Image) (image.Image, error) {
+	return resizeImage(img, s.width, s.height), nil
+}
+
 // resizeImage resizes an image to the given width and height using nearest neighbor (simple, replace with better if needed).
 func resizeImage(img image.Image, newW, newH int) image.Image {
 	dst := image.NewRGBA(image.Rect(0, 0, newW, newH))
