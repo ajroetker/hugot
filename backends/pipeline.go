@@ -50,9 +50,9 @@ func NewShape(dimensions ...int64) Shape {
 // Models exported with no_dynamic_axes=True (e.g., via Optimum) have positive dimension
 // values, while dynamic models use -1 or 0 to indicate variable dimensions.
 type FixedShapeInfo struct {
-	BatchSize     int
+	BatchSize      int
 	SequenceLength int
-	HasFixedShape bool
+	HasFixedShape  bool
 }
 
 // GetFixedShapeFromInputs examines model input metadata to detect fixed-shape models.

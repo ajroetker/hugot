@@ -47,6 +47,11 @@ type Vision2SeqPipeline struct {
 	DecoderWithPastModel *backends.Model // For split decoder (with past)
 	useSplitDecoder      bool            // True if using split decoder
 
+	// Florence-2 specific models (separate vision encoder architecture)
+	VisionEncoderModel *backends.Model // For vision_encoder.onnx (pixel_values -> image_features)
+	EmbedTokensModel   *backends.Model // For embed_tokens.onnx (input_ids -> inputs_embeds)
+	hasSeparateVision  bool            // True if using separate vision encoder (Florence-2)
+
 	// Tokenizer (for decoding output tokens)
 	Tokenizer *backends.Tokenizer
 
@@ -160,18 +165,21 @@ func NewVision2SeqPipeline(
 	config backends.PipelineConfig[*Vision2SeqPipeline],
 	opts *options.Options,
 ) (*Vision2SeqPipeline, error) {
+	// Get default profile - will be refined after loading model config
+	defaultProfile := backends.DefaultModelProfile()
+
 	pipeline := &Vision2SeqPipeline{
 		PipelineName:    config.Name,
 		PipelineTimings: &vision2seqTimings{},
 		Runtime:         opts.Backend,
 
-		// Defaults
-		MaxNewTokens:      128,
-		DoSample:          false,
-		TopP:              0.9,
-		Temperature:       1.0,
-		RepetitionPenalty: 1.0,
-		ImageSize:         384, // TrOCR default
+		// Use defaults from profile (will be overridden by model config if detected)
+		MaxNewTokens:      defaultProfile.MaxNewTokens,
+		DoSample:          defaultProfile.DoSample,
+		TopP:              defaultProfile.TopP,
+		Temperature:       defaultProfile.Temperature,
+		RepetitionPenalty: defaultProfile.RepetitionPenalty,
+		ImageSize:         defaultProfile.DefaultImageSize,
 		imageFormat:       "NCHW",
 	}
 
@@ -219,33 +227,80 @@ func (p *Vision2SeqPipeline) loadModels(modelPath string, opts *options.Options)
 		return fmt.Errorf("loading config: %w", err)
 	}
 
-	// Load vision encoder
-	p.EncoderModel, err = backends.LoadVision2SeqEncoder(modelPath, opts)
-	if err != nil {
-		return fmt.Errorf("loading encoder: %w", err)
+	// Check if this is a Florence-2 style model with separate vision encoder
+	p.hasSeparateVision = backends.HasSeparateVisionEncoder(modelPath)
+
+	if p.hasSeparateVision {
+		// Florence-2 architecture: vision_encoder + embed_tokens + encoder
+		p.VisionEncoderModel, err = backends.LoadVision2SeqVisionEncoder(modelPath, opts)
+		if err != nil {
+			return fmt.Errorf("loading vision encoder: %w", err)
+		}
+
+		p.EmbedTokensModel, err = backends.LoadVision2SeqEmbedTokens(modelPath, opts)
+		if err != nil {
+			return fmt.Errorf("loading embed tokens: %w", err)
+		}
+
+		p.EncoderModel, err = backends.LoadVision2SeqFlorenceEncoder(modelPath, opts)
+		if err != nil {
+			return fmt.Errorf("loading florence encoder: %w", err)
+		}
+	} else {
+		// Standard vision-encoder-decoder (TrOCR, Donut, Nougat)
+		p.EncoderModel, err = backends.LoadVision2SeqEncoder(modelPath, opts)
+		if err != nil {
+			return fmt.Errorf("loading encoder: %w", err)
+		}
 	}
 
-	// Try to load split decoders first (init + with_past)
-	// This is more reliable than merged decoders
-	initDecoder, initErr := backends.LoadVision2SeqDecoderInit(modelPath, opts, p.NumDecoderLayers)
-	withPastDecoder, withPastErr := backends.LoadVision2SeqDecoderWithPast(modelPath, opts, p.NumDecoderLayers)
-
-	if initErr == nil && withPastErr == nil {
-		// Successfully loaded split decoders
-		p.DecoderInitModel = initDecoder
-		p.DecoderWithPastModel = withPastDecoder
-		p.useSplitDecoder = true
-	} else {
-		// Fall back to merged decoder
-		p.DecoderModel, err = backends.LoadVision2SeqDecoder(modelPath, opts, p.NumDecoderLayers)
-		if err != nil {
-			// If merged also fails, return the original split decoder errors
-			if initErr != nil {
-				return fmt.Errorf("loading init decoder: %w", initErr)
+	// Load decoder(s)
+	// Florence-2 prefers merged decoder since split decoders have static sequence lengths
+	// Standard models prefer split decoders for better performance
+	if p.hasSeparateVision {
+		// Florence-2 architecture: prefer merged decoder with inputs_embeds
+		mergedDecoder, mergedErr := backends.LoadVision2SeqFlorenceMergedDecoder(modelPath, opts, p.NumDecoderLayers)
+		if mergedErr == nil {
+			p.DecoderModel = mergedDecoder
+			p.useSplitDecoder = false
+		} else {
+			// Fall back to split decoders
+			initDecoder, initErr := backends.LoadVision2SeqFlorenceDecoderInit(modelPath, opts, p.NumDecoderLayers)
+			withPastDecoder, withPastErr := backends.LoadVision2SeqFlorenceDecoderWithPast(modelPath, opts, p.NumDecoderLayers)
+			if initErr == nil && withPastErr == nil {
+				p.DecoderInitModel = initDecoder
+				p.DecoderWithPastModel = withPastDecoder
+				p.useSplitDecoder = true
+			} else {
+				// Both failed
+				if mergedErr != nil {
+					return fmt.Errorf("loading Florence merged decoder: %w", mergedErr)
+				}
+				if initErr != nil {
+					return fmt.Errorf("loading init decoder: %w", initErr)
+				}
+				return fmt.Errorf("loading with-past decoder: %w", withPastErr)
 			}
-			return fmt.Errorf("loading with-past decoder: %w", withPastErr)
 		}
-		p.useSplitDecoder = false
+	} else {
+		// Standard vision-encoder-decoder (TrOCR, Donut, Nougat): prefer split decoders
+		initDecoder, initErr := backends.LoadVision2SeqDecoderInit(modelPath, opts, p.NumDecoderLayers)
+		withPastDecoder, withPastErr := backends.LoadVision2SeqDecoderWithPast(modelPath, opts, p.NumDecoderLayers)
+		if initErr == nil && withPastErr == nil {
+			p.DecoderInitModel = initDecoder
+			p.DecoderWithPastModel = withPastDecoder
+			p.useSplitDecoder = true
+		} else {
+			// Fall back to merged decoder
+			p.DecoderModel, err = backends.LoadVision2SeqDecoder(modelPath, opts, p.NumDecoderLayers)
+			if err != nil {
+				if initErr != nil {
+					return fmt.Errorf("loading init decoder: %w", initErr)
+				}
+				return fmt.Errorf("loading with-past decoder: %w", withPastErr)
+			}
+			p.useSplitDecoder = false
+		}
 	}
 
 	// Load tokenizer
@@ -280,8 +335,20 @@ func (p *Vision2SeqPipeline) loadConfig(modelPath string) error {
 		p.OutputFormat = config.OutputFormat
 	}
 
+	// Apply generation defaults from the detected model profile
+	if config.ModelType != "" {
+		profile := backends.GetProfileByModelTypeString(config.ModelType)
+		// Only apply profile defaults if user hasn't overridden them
+		// (we check against the default profile values set in NewVision2SeqPipeline)
+		defaultProfile := backends.DefaultModelProfile()
+		if p.MaxNewTokens == defaultProfile.MaxNewTokens {
+			p.MaxNewTokens = profile.MaxNewTokens
+		}
+	}
+
 	// Override image dimensions if not set by user
-	if config.ImageSize > 0 && p.ImageSize == 384 {
+	defaultProfile := backends.DefaultModelProfile()
+	if config.ImageSize > 0 && p.ImageSize == defaultProfile.DefaultImageSize {
 		p.ImageSize = config.ImageSize
 	}
 	if config.ImageWidth > 0 {
@@ -312,9 +379,17 @@ func (p *Vision2SeqPipeline) loadConfig(modelPath string) error {
 func (p *Vision2SeqPipeline) buildPreprocessSteps(config *backends.Vision2SeqConfig) {
 	var steps []imageutil.PreprocessStep
 
-	// Donut/Nougat: optional margin cropping
+	// Get profile for crop margin parameters
+	profile := backends.GetProfileByModelTypeString(config.ModelType)
+
+	// Optional margin cropping (uses profile defaults if not set in config)
 	if config.DoCropMargin {
-		steps = append(steps, imageutil.CropMarginStep(250, 0))
+		threshold := profile.CropThreshold
+		if threshold == 0 {
+			threshold = 250 // Fallback default
+		}
+		minMargin := profile.CropMinMargin
+		steps = append(steps, imageutil.CropMarginStep(threshold, minMargin))
 	}
 
 	// Donut: align long axis to portrait
@@ -591,9 +666,17 @@ func (p *Vision2SeqPipeline) Preprocess(batch *backends.Vision2SeqBatch) error {
 func (p *Vision2SeqPipeline) Encode(batch *backends.Vision2SeqBatch) error {
 	start := time.Now()
 
-	err := backends.RunVision2SeqEncoder(batch, p.EncoderModel, p.Runtime)
+	var err error
+	if p.hasSeparateVision {
+		// Florence-2 architecture: vision_encoder + embed_tokens + encoder
+		err = backends.RunFlorenceEncoder(batch, p, p.Runtime)
+	} else {
+		// Standard vision-encoder-decoder (TrOCR, Donut, Nougat)
+		err = backends.RunVision2SeqEncoder(batch, p.EncoderModel, p.Runtime)
+	}
+
 	if err != nil {
-		return err
+		return fmt.Errorf("encode: %w", err)
 	}
 
 	atomic.AddUint64(&p.PipelineTimings.EncoderNumCalls, 1)
@@ -650,6 +733,14 @@ func (p *Vision2SeqPipeline) Postprocess(batch *backends.Vision2SeqBatch) (*Visi
 func (p *Vision2SeqPipeline) Destroy() error {
 	var errs []error
 
+	// Clean up Florence-2 specific models
+	if p.VisionEncoderModel != nil && p.VisionEncoderModel.Destroy != nil {
+		errs = append(errs, p.VisionEncoderModel.Destroy())
+	}
+	if p.EmbedTokensModel != nil && p.EmbedTokensModel.Destroy != nil {
+		errs = append(errs, p.EmbedTokensModel.Destroy())
+	}
+
 	if p.EncoderModel != nil && p.EncoderModel.Destroy != nil {
 		errs = append(errs, p.EncoderModel.Destroy())
 	}
@@ -693,6 +784,11 @@ func (p *Vision2SeqPipeline) GetHeadDim() int                   { return p.HeadD
 func (p *Vision2SeqPipeline) GetDecoderInitModel() *backends.Model     { return p.DecoderInitModel }
 func (p *Vision2SeqPipeline) GetDecoderWithPastModel() *backends.Model { return p.DecoderWithPastModel }
 func (p *Vision2SeqPipeline) UseSplitDecoder() bool                    { return p.useSplitDecoder }
+
+// Florence-2 specific methods
+func (p *Vision2SeqPipeline) GetVisionEncoderModel() *backends.Model { return p.VisionEncoderModel }
+func (p *Vision2SeqPipeline) GetEmbedTokensModel() *backends.Model   { return p.EmbedTokensModel }
+func (p *Vision2SeqPipeline) HasSeparateVisionEncoder() bool         { return p.hasSeparateVision }
 
 // Non-square image support (Donut, Nougat)
 func (p *Vision2SeqPipeline) GetImageWidth() int {

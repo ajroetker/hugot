@@ -18,3 +18,8 @@ func RunVision2SeqGenerationGreedy(batch Vision2SeqBatchInterface, pipeline Visi
 func RunVision2SeqGenerationSampling(batch Vision2SeqBatchInterface, pipeline Vision2SeqPipelineInterface) error {
 	return errors.New("ORT is not enabled - vision2seq requires ORT backend")
 }
+
+// RunFlorenceEncoder is a stub when ORT is disabled.
+func RunFlorenceEncoder(batch Vision2SeqBatchInterface, pipeline Vision2SeqPipelineInterface, runtime string) error {
+	return errors.New("ORT is not enabled - Florence encoder requires ORT backend")
+}

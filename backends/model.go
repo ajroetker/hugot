@@ -41,7 +41,7 @@ type Model struct {
 
 func LoadModel(path string, onnxFilename string, options *options.Options, isGenerative bool) (*Model, error) {
 	model := &Model{
-		ID: 		  path + ":" + onnxFilename,
+		ID:           path + ":" + onnxFilename,
 		Path:         path,
 		OnnxFilename: onnxFilename,
 		Pipelines:    make(map[string]Pipeline),

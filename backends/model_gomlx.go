@@ -188,7 +188,7 @@ func getCacheAndBucketSizes(options *options.Options, model *Model, backend stri
 	}
 
 	// If using simpleGo, and user hasnt specified custom buckets, set max cache to unlimitted and disable bucketing
-	if  backend == "go" && !bucketsSpecified {
+	if backend == "go" && !bucketsSpecified {
 		return -1, []int{}, []int{}
 	}
 

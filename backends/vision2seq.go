@@ -12,7 +12,7 @@ import (
 )
 
 // Vision2SeqPipelineInterface defines the interface for vision-to-sequence pipeline access.
-// This is used by encoder-decoder models like TrOCR, Donut, and Nougat where input is an image and output is text.
+// This is used by encoder-decoder models like TrOCR, Donut, Florence-2, and Nougat where input is an image and output is text.
 type Vision2SeqPipelineInterface interface {
 	GetEncoderModel() *Model
 	GetDecoderModel() *Model
@@ -35,8 +35,13 @@ type Vision2SeqPipelineInterface interface {
 	GetImageHeight() int // For non-square images (Donut, Nougat)
 	GetNumHeads() int
 	GetHeadDim() int
-	GetModelType() string    // "trocr", "donut", "nougat"
+	GetModelType() string    // "trocr", "donut", "florence", "nougat"
 	GetOutputFormat() string // "text", "json", "markdown"
+
+	// Florence-2 specific models (separate vision encoder architecture)
+	GetVisionEncoderModel() *Model  // Returns vision_encoder model (nil if not Florence-2)
+	GetEmbedTokensModel() *Model    // Returns embed_tokens model (nil if not Florence-2)
+	HasSeparateVisionEncoder() bool // True if using Florence-2 style separate vision encoder
 }
 
 // Vision2SeqBatchInterface defines the interface for vision2seq batch access.
@@ -98,15 +103,11 @@ type Vision2SeqConfig struct {
 	PadValue        float32 // Background color for padding (default: 1.0 = white)
 
 	// Model type detection
-	ModelType    string // "trocr", "donut", "nougat", "auto"
+	ModelType    string // "trocr", "donut", "florence", "nougat", "auto"
 	OutputFormat string // "text", "json", "markdown"
 }
 
-// Vision encoder standard input/output names (TrOCR, etc.)
-var (
-	vision2SeqEncoderInputs  = []string{"pixel_values"}
-	vision2SeqEncoderOutputs = []string{"last_hidden_state"}
-)
+// I/O names are now defined in vision2seq_models.go via GetModelProfile() and GetFlorenceIONames()
 
 // LoadVision2SeqEncoder loads the vision encoder model for vision2seq inference.
 // Looks for encoder_model.onnx or *encoder*.onnx in the model path.
@@ -135,8 +136,9 @@ func LoadVision2SeqEncoder(modelPath string, opts *options.Options) (*Model, err
 	// Use predefined input/output names to avoid metadata extraction which
 	// creates a temporary session without our session options (e.g., disabled
 	// graph optimizations for model compatibility)
+	profile := DefaultModelProfile()
 	if opts.Backend == "ORT" {
-		if err := CreateORTModelBackendWithNames(model, opts, vision2SeqEncoderInputs, vision2SeqEncoderOutputs); err != nil {
+		if err := CreateORTModelBackendWithNames(model, opts, profile.EncoderInputs, profile.EncoderOutputs); err != nil {
 			return nil, err
 		}
 	} else {
@@ -160,6 +162,175 @@ func LoadVision2SeqEncoder(modelPath string, opts *options.Options) (*Model, err
 	}
 
 	return model, nil
+}
+
+// LoadVision2SeqVisionEncoder loads the separate vision encoder for Florence-2.
+// Looks for vision_encoder.onnx in the model path.
+func LoadVision2SeqVisionEncoder(modelPath string, opts *options.Options) (*Model, error) {
+	// First check in onnx/ subdirectory (common for HuggingFace models)
+	onnxDir := fileutil.PathJoinSafe(modelPath, "onnx")
+	if exists, _ := fileutil.FileExists(onnxDir); exists {
+		modelPath = onnxDir
+	}
+
+	onnxFile, err := findVision2SeqOnnxFile(modelPath, "vision_encoder")
+	if err != nil {
+		return nil, err
+	}
+
+	model := &Model{
+		Path:         modelPath,
+		OnnxFilename: onnxFile,
+		Pipelines:    make(map[string]Pipeline),
+	}
+
+	if err := LoadOnnxModelBytes(model); err != nil {
+		return nil, err
+	}
+
+	florenceIO := GetFlorenceIONames()
+	if opts.Backend == "ORT" {
+		if err := CreateORTModelBackendWithNames(model, opts, florenceIO.VisionEncoderInputs, florenceIO.VisionEncoderOutputs); err != nil {
+			return nil, err
+		}
+	} else {
+		if err := CreateModelBackend(model, opts); err != nil {
+			return nil, err
+		}
+	}
+
+	model.Destroy = func() error {
+		switch opts.Backend {
+		case "ORT":
+			if model.ORTModel != nil {
+				return model.ORTModel.Destroy()
+			}
+		case "GO", "XLA":
+			if model.GoMLXModel != nil {
+				model.GoMLXModel.Destroy()
+			}
+		}
+		return nil
+	}
+
+	return model, nil
+}
+
+// LoadVision2SeqEmbedTokens loads the embed_tokens model for Florence-2.
+// Looks for embed_tokens.onnx in the model path.
+func LoadVision2SeqEmbedTokens(modelPath string, opts *options.Options) (*Model, error) {
+	// First check in onnx/ subdirectory (common for HuggingFace models)
+	onnxDir := fileutil.PathJoinSafe(modelPath, "onnx")
+	if exists, _ := fileutil.FileExists(onnxDir); exists {
+		modelPath = onnxDir
+	}
+
+	onnxFile, err := findVision2SeqOnnxFile(modelPath, "embed_tokens")
+	if err != nil {
+		return nil, err
+	}
+
+	model := &Model{
+		Path:         modelPath,
+		OnnxFilename: onnxFile,
+		Pipelines:    make(map[string]Pipeline),
+	}
+
+	if err := LoadOnnxModelBytes(model); err != nil {
+		return nil, err
+	}
+
+	florenceIO := GetFlorenceIONames()
+	if opts.Backend == "ORT" {
+		if err := CreateORTModelBackendWithNames(model, opts, florenceIO.EmbedTokensInputs, florenceIO.EmbedTokensOutputs); err != nil {
+			return nil, err
+		}
+	} else {
+		if err := CreateModelBackend(model, opts); err != nil {
+			return nil, err
+		}
+	}
+
+	model.Destroy = func() error {
+		switch opts.Backend {
+		case "ORT":
+			if model.ORTModel != nil {
+				return model.ORTModel.Destroy()
+			}
+		case "GO", "XLA":
+			if model.GoMLXModel != nil {
+				model.GoMLXModel.Destroy()
+			}
+		}
+		return nil
+	}
+
+	return model, nil
+}
+
+// LoadVision2SeqFlorenceEncoder loads the text encoder for Florence-2.
+// This differs from the standard encoder as it takes inputs_embeds instead of pixel_values.
+func LoadVision2SeqFlorenceEncoder(modelPath string, opts *options.Options) (*Model, error) {
+	// First check in onnx/ subdirectory (common for HuggingFace models)
+	onnxDir := fileutil.PathJoinSafe(modelPath, "onnx")
+	if exists, _ := fileutil.FileExists(onnxDir); exists {
+		modelPath = onnxDir
+	}
+
+	onnxFile, err := findVision2SeqOnnxFile(modelPath, "encoder")
+	if err != nil {
+		return nil, err
+	}
+
+	model := &Model{
+		Path:         modelPath,
+		OnnxFilename: onnxFile,
+		Pipelines:    make(map[string]Pipeline),
+	}
+
+	if err := LoadOnnxModelBytes(model); err != nil {
+		return nil, err
+	}
+
+	florenceIO := GetFlorenceIONames()
+	if opts.Backend == "ORT" {
+		if err := CreateORTModelBackendWithNames(model, opts, florenceIO.EncoderInputs, florenceIO.EncoderOutputs); err != nil {
+			return nil, err
+		}
+	} else {
+		if err := CreateModelBackend(model, opts); err != nil {
+			return nil, err
+		}
+	}
+
+	model.Destroy = func() error {
+		switch opts.Backend {
+		case "ORT":
+			if model.ORTModel != nil {
+				return model.ORTModel.Destroy()
+			}
+		case "GO", "XLA":
+			if model.GoMLXModel != nil {
+				model.GoMLXModel.Destroy()
+			}
+		}
+		return nil
+	}
+
+	return model, nil
+}
+
+// HasSeparateVisionEncoder checks if the model uses Florence-2 style separate vision encoder.
+func HasSeparateVisionEncoder(modelPath string) bool {
+	// Check in onnx/ subdirectory first
+	onnxDir := fileutil.PathJoinSafe(modelPath, "onnx")
+	if exists, _ := fileutil.FileExists(onnxDir); exists {
+		modelPath = onnxDir
+	}
+
+	// Look for vision_encoder.onnx
+	_, err := findVision2SeqOnnxFile(modelPath, "vision_encoder")
+	return err == nil
 }
 
 // buildDecoderInitIONames generates input/output names for the init decoder (no past).
@@ -187,6 +358,57 @@ func buildDecoderInitIONames(numLayers int) (inputs, outputs []string) {
 func buildDecoderWithPastIONames(numLayers int) (inputs, outputs []string) {
 	// Inputs: input_ids, then past_key_values (NO encoder_hidden_states)
 	inputs = []string{"input_ids"}
+
+	// Past key values for each layer (decoder self-attention + encoder cross-attention)
+	for i := 0; i < numLayers; i++ {
+		inputs = append(inputs,
+			fmt.Sprintf("past_key_values.%d.decoder.key", i),
+			fmt.Sprintf("past_key_values.%d.decoder.value", i),
+			fmt.Sprintf("past_key_values.%d.encoder.key", i),
+			fmt.Sprintf("past_key_values.%d.encoder.value", i),
+		)
+	}
+
+	// Outputs: logits + present KV (only decoder grows, encoder passed through)
+	outputs = []string{"logits"}
+	for i := 0; i < numLayers; i++ {
+		outputs = append(outputs,
+			fmt.Sprintf("present.%d.decoder.key", i),
+			fmt.Sprintf("present.%d.decoder.value", i),
+			// Note: encoder PKV is not in outputs for with-past decoder
+		)
+	}
+
+	return inputs, outputs
+}
+
+// buildFlorenceDecoderInitIONames generates input/output names for Florence-2 init decoder.
+// Florence-2 decoder takes inputs_embeds instead of input_ids, and requires encoder_attention_mask.
+func buildFlorenceDecoderInitIONames(numLayers int) (inputs, outputs []string) {
+	florenceIO := GetFlorenceIONames()
+	inputs = make([]string, len(florenceIO.DecoderInitInputsBase))
+	copy(inputs, florenceIO.DecoderInitInputsBase)
+
+	// Outputs: logits + present KV for each layer
+	outputs = []string{"logits"}
+	for i := 0; i < numLayers; i++ {
+		outputs = append(outputs,
+			fmt.Sprintf("present.%d.decoder.key", i),
+			fmt.Sprintf("present.%d.decoder.value", i),
+			fmt.Sprintf("present.%d.encoder.key", i),
+			fmt.Sprintf("present.%d.encoder.value", i),
+		)
+	}
+
+	return inputs, outputs
+}
+
+// buildFlorenceDecoderWithPastIONames generates input/output names for Florence-2 decoder with past.
+// Florence-2 decoder takes inputs_embeds instead of input_ids.
+func buildFlorenceDecoderWithPastIONames(numLayers int) (inputs, outputs []string) {
+	florenceIO := GetFlorenceIONames()
+	inputs = make([]string, len(florenceIO.DecoderWithPastInputsBase))
+	copy(inputs, florenceIO.DecoderWithPastInputsBase)
 
 	// Past key values for each layer (decoder self-attention + encoder cross-attention)
 	for i := 0; i < numLayers; i++ {
@@ -353,6 +575,202 @@ func LoadVision2SeqDecoderWithPast(modelPath string, opts *options.Options, numD
 	return model, nil
 }
 
+// LoadVision2SeqFlorenceDecoderInit loads the Florence-2 init decoder model.
+// Florence-2 decoder takes inputs_embeds instead of input_ids.
+func LoadVision2SeqFlorenceDecoderInit(modelPath string, opts *options.Options, numDecoderLayers int) (*Model, error) {
+	if numDecoderLayers <= 0 {
+		return nil, errors.New("numDecoderLayers must be positive")
+	}
+
+	// First check in onnx/ subdirectory
+	onnxDir := fileutil.PathJoinSafe(modelPath, "onnx")
+	if exists, _ := fileutil.FileExists(onnxDir); exists {
+		modelPath = onnxDir
+	}
+
+	// Look for decoder_model.onnx specifically (not merged, not with_past)
+	onnxFile, err := findVision2SeqOnnxFile(modelPath, "decoder_init")
+	if err != nil {
+		return nil, err
+	}
+
+	model := &Model{
+		Path:         modelPath,
+		OnnxFilename: onnxFile,
+		Pipelines:    make(map[string]Pipeline),
+	}
+
+	if err := LoadOnnxModelBytes(model); err != nil {
+		return nil, err
+	}
+
+	if opts.Backend == "ORT" {
+		decoderInputs, decoderOutputs := buildFlorenceDecoderInitIONames(numDecoderLayers)
+		if err := CreateORTModelBackendWithNames(model, opts, decoderInputs, decoderOutputs); err != nil {
+			return nil, err
+		}
+	} else {
+		if err := CreateModelBackend(model, opts); err != nil {
+			return nil, err
+		}
+	}
+
+	model.Destroy = func() error {
+		switch opts.Backend {
+		case "ORT":
+			if model.ORTModel != nil {
+				return model.ORTModel.Destroy()
+			}
+		case "GO", "XLA":
+			if model.GoMLXModel != nil {
+				model.GoMLXModel.Destroy()
+			}
+		}
+		return nil
+	}
+
+	return model, nil
+}
+
+// LoadVision2SeqFlorenceDecoderWithPast loads the Florence-2 decoder with past model.
+// Florence-2 decoder takes inputs_embeds instead of input_ids.
+func LoadVision2SeqFlorenceDecoderWithPast(modelPath string, opts *options.Options, numDecoderLayers int) (*Model, error) {
+	if numDecoderLayers <= 0 {
+		return nil, errors.New("numDecoderLayers must be positive")
+	}
+
+	// First check in onnx/ subdirectory
+	onnxDir := fileutil.PathJoinSafe(modelPath, "onnx")
+	if exists, _ := fileutil.FileExists(onnxDir); exists {
+		modelPath = onnxDir
+	}
+
+	onnxFile, err := findVision2SeqOnnxFile(modelPath, "decoder_with_past")
+	if err != nil {
+		return nil, err
+	}
+
+	model := &Model{
+		Path:         modelPath,
+		OnnxFilename: onnxFile,
+		Pipelines:    make(map[string]Pipeline),
+	}
+
+	if err := LoadOnnxModelBytes(model); err != nil {
+		return nil, err
+	}
+
+	if opts.Backend == "ORT" {
+		decoderInputs, decoderOutputs := buildFlorenceDecoderWithPastIONames(numDecoderLayers)
+		if err := CreateORTModelBackendWithNames(model, opts, decoderInputs, decoderOutputs); err != nil {
+			return nil, err
+		}
+	} else {
+		if err := CreateModelBackend(model, opts); err != nil {
+			return nil, err
+		}
+	}
+
+	model.Destroy = func() error {
+		switch opts.Backend {
+		case "ORT":
+			if model.ORTModel != nil {
+				return model.ORTModel.Destroy()
+			}
+		case "GO", "XLA":
+			if model.GoMLXModel != nil {
+				model.GoMLXModel.Destroy()
+			}
+		}
+		return nil
+	}
+
+	return model, nil
+}
+
+// buildFlorenceMergedDecoderIONames generates input/output names for Florence-2 merged decoder.
+// Florence uses inputs_embeds instead of input_ids, plus encoder_attention_mask.
+func buildFlorenceMergedDecoderIONames(numLayers int) (inputs, outputs []string) {
+	// Core inputs from Florence I/O registry
+	florenceIO := GetFlorenceIONames()
+	inputs = append(inputs, florenceIO.MergedDecoderInputsBase...)
+
+	// Past key values for each layer (decoder and encoder KV)
+	for i := 0; i < numLayers; i++ {
+		inputs = append(inputs,
+			fmt.Sprintf("past_key_values.%d.decoder.key", i),
+			fmt.Sprintf("past_key_values.%d.decoder.value", i),
+			fmt.Sprintf("past_key_values.%d.encoder.key", i),
+			fmt.Sprintf("past_key_values.%d.encoder.value", i),
+		)
+	}
+	inputs = append(inputs, florenceIO.UseCacheBranch)
+
+	// Outputs: logits + present KV for each layer
+	outputs = []string{"logits"}
+	for i := 0; i < numLayers; i++ {
+		outputs = append(outputs,
+			fmt.Sprintf("present.%d.decoder.key", i),
+			fmt.Sprintf("present.%d.decoder.value", i),
+			fmt.Sprintf("present.%d.encoder.key", i),
+			fmt.Sprintf("present.%d.encoder.value", i),
+		)
+	}
+
+	return inputs, outputs
+}
+
+// LoadVision2SeqFlorenceMergedDecoder loads the merged decoder model for Florence-2.
+// This handles both initial and subsequent steps in a single model with use_cache_branch.
+func LoadVision2SeqFlorenceMergedDecoder(modelPath string, opts *options.Options, numDecoderLayers int) (*Model, error) {
+	if numDecoderLayers <= 0 {
+		return nil, errors.New("numDecoderLayers must be positive")
+	}
+
+	// First check in onnx/ subdirectory
+	onnxDir := fileutil.PathJoinSafe(modelPath, "onnx")
+	if exists, _ := fileutil.FileExists(onnxDir); exists {
+		modelPath = onnxDir
+	}
+
+	onnxFile, err := findVision2SeqOnnxFile(modelPath, "decoder_merged")
+	if err != nil {
+		return nil, err
+	}
+
+	model := &Model{
+		Path:         modelPath,
+		OnnxFilename: onnxFile,
+		Pipelines:    make(map[string]Pipeline),
+	}
+
+	if err := LoadOnnxModelBytes(model); err != nil {
+		return nil, err
+	}
+
+	// Use CreateModelBackend to get actual input/output metadata from the ONNX model.
+	// This provides proper dimension info for PKV shape inference.
+	if err := CreateModelBackend(model, opts); err != nil {
+		return nil, err
+	}
+
+	model.Destroy = func() error {
+		switch opts.Backend {
+		case "ORT":
+			if model.ORTModel != nil {
+				return model.ORTModel.Destroy()
+			}
+		case "GO", "XLA":
+			if model.GoMLXModel != nil {
+				model.GoMLXModel.Destroy()
+			}
+		}
+		return nil
+	}
+
+	return model, nil
+}
+
 // LoadVision2SeqDecoder loads the decoder model for vision2seq inference.
 // Looks for decoder_model_merged.onnx or decoder*.onnx in the model path.
 // The "merged" decoder handles both initial step (no past_key_values) and
@@ -430,7 +848,7 @@ func LoadVision2SeqTokenizer(modelPath string, opts *options.Options) (*Tokenize
 // LoadVision2SeqConfig loads the model configuration from config.json.
 // TrOCR models have a nested structure with vision_config and text_config.
 // Also loads generation_config.json for token IDs if not found in config.json.
-// Supports TrOCR, Donut, and Nougat model types.
+// Supports TrOCR, Donut, Florence-2, and Nougat model types.
 func LoadVision2SeqConfig(modelPath string) (*Vision2SeqConfig, error) {
 	configPath := fileutil.PathJoinSafe(modelPath, "config.json")
 
@@ -456,9 +874,20 @@ func LoadVision2SeqConfig(modelPath string) (*Vision2SeqConfig, error) {
 		EosTokenIDs:  make(map[int64]bool),
 		ImageSize:    384, // Default for TrOCR
 		NumChannels:  3,
-		PadValue:     1.0,          // White padding by default
-		ModelType:    "auto",       // Auto-detect
-		OutputFormat: "text",       // Plain text by default
+		PadValue:     1.0,    // White padding by default
+		ModelType:    "auto", // Auto-detect
+		OutputFormat: "text", // Plain text by default
+	}
+
+	// Check top-level model_type for Florence-2 and similar models
+	if modelType, ok := configMap["model_type"].(string); ok {
+		switch modelType {
+		case "florence2":
+			config.ModelType = "florence"
+			config.OutputFormat = "text"
+		case "vision-encoder-decoder":
+			// Fall through to encoder config parsing
+		}
 	}
 
 	// Parse encoder config for image dimensions and detect model type
@@ -715,48 +1144,40 @@ func parseEncoderConfig(cfg map[string]any, config *Vision2SeqConfig, modelPath 
 		config.NumChannels = int(v)
 	}
 
-	// Detect model type from encoder model_type
-	if modelType, ok := cfg["model_type"].(string); ok {
-		switch modelType {
-		case "donut-swin":
-			config.ModelType = "donut"
-			config.OutputFormat = "json"
-			config.DoAlignLongAxis = true
-			config.DoPad = true
-		case "swin", "swinv2":
-			// Could be Nougat or similar - check path for hints
-			if strings.Contains(strings.ToLower(modelPath), "nougat") {
-				config.ModelType = "nougat"
-				config.OutputFormat = "markdown"
-				config.DoCropMargin = true
-				config.DoPad = true
-			} else {
-				// Default to donut-like behavior for swin encoders
-				config.ModelType = "donut"
-				config.OutputFormat = "json"
-				config.DoPad = true
-			}
-		case "vit", "deit", "beit":
-			config.ModelType = "trocr"
-			config.OutputFormat = "text"
-		default:
-			// Try to detect from path
-			pathLower := strings.ToLower(modelPath)
-			if strings.Contains(pathLower, "trocr") {
-				config.ModelType = "trocr"
-				config.OutputFormat = "text"
-			} else if strings.Contains(pathLower, "donut") {
-				config.ModelType = "donut"
-				config.OutputFormat = "json"
-				config.DoPad = true
-			} else if strings.Contains(pathLower, "nougat") {
-				config.ModelType = "nougat"
-				config.OutputFormat = "markdown"
-				config.DoCropMargin = true
-				config.DoPad = true
-			}
+	// Detect model type from encoder model_type using the registry
+	var detectedType Vision2SeqModelType
+	if encoderModelType, ok := cfg["model_type"].(string); ok {
+		detectedType = DetectModelTypeFromEncoder(encoderModelType)
+
+		// Special case: swin/swinv2 could be Nougat - check path
+		if (encoderModelType == "swin" || encoderModelType == "swinv2") &&
+			DetectModelTypeFromPath(modelPath) == ModelTypeNougat {
+			detectedType = ModelTypeNougat
 		}
 	}
+
+	// Fall back to path-based detection if encoder type didn't match
+	if detectedType == ModelTypeUnknown {
+		detectedType = DetectModelTypeFromPath(modelPath)
+	}
+
+	// Apply the detected model profile
+	if detectedType != ModelTypeUnknown {
+		applyModelProfile(config, detectedType)
+	}
+}
+
+// applyModelProfile applies a model profile's settings to the config.
+// Only applies preprocessing flags; other config values come from model files.
+func applyModelProfile(config *Vision2SeqConfig, modelType Vision2SeqModelType) {
+	profile := GetModelProfile(modelType)
+	config.ModelType = string(profile.ModelType)
+	config.OutputFormat = profile.OutputFormat
+	config.DoAlignLongAxis = profile.DoAlignLongAxis
+	config.DoPad = profile.DoPad
+	config.DoCropMargin = profile.DoCropMargin
+	config.DoThumbnail = profile.DoThumbnail
+	// Note: PadValue defaults are already set in config initialization
 }
 
 // findVision2SeqOnnxFile finds an ONNX file for vision2seq models.
@@ -772,10 +1193,22 @@ func findVision2SeqOnnxFile(modelPath string, modelType string) (string, error) 
 	switch modelType {
 	case "encoder":
 		patterns = []string{"encoder_model", "encoder"}
+		excludePatterns = []string{"vision_encoder", "quantized", "fp16", "int8", "uint8", "bnb4", "q4", "q4f16"}
+	case "vision_encoder":
+		// Florence-2 vision encoder: vision_encoder.onnx
+		patterns = []string{"vision_encoder"}
+		excludePatterns = []string{"quantized", "fp16", "int8", "uint8", "bnb4", "q4", "q4f16"}
+	case "embed_tokens":
+		// Florence-2 embed tokens: embed_tokens.onnx
+		patterns = []string{"embed_tokens"}
 		excludePatterns = []string{"quantized", "fp16", "int8", "uint8", "bnb4", "q4", "q4f16"}
 	case "decoder":
 		// Prefer merged decoder (single model for both init and subsequent steps)
 		patterns = []string{"decoder_model_merged", "decoder_model", "decoder"}
+		excludePatterns = []string{"quantized", "fp16", "int8", "uint8", "bnb4", "q4", "q4f16"}
+	case "decoder_merged":
+		// Merged decoder specifically: decoder_model_merged.onnx
+		patterns = []string{"decoder_model_merged"}
 		excludePatterns = []string{"quantized", "fp16", "int8", "uint8", "bnb4", "q4", "q4f16"}
 	case "decoder_init":
 		// Init decoder: decoder_model.onnx (not merged, not with_past)
@@ -812,9 +1245,9 @@ func findVision2SeqOnnxFile(modelPath string, modelType string) (string, error) 
 // Vision2SeqBatch holds the intermediate state during vision2seq generation.
 type Vision2SeqBatch struct {
 	// Input
-	Images            []image.Image
-	PreprocessedData  [][][][]float32
-	Size              int
+	Images           []image.Image
+	PreprocessedData [][][][]float32
+	Size             int
 
 	// Encoder output (cached for decoder)
 	EncoderHiddenStates any // Backend-specific tensor
@@ -855,22 +1288,22 @@ func (b *Vision2SeqBatch) Destroy() error {
 
 // Interface implementations for Vision2SeqBatchInterface
 
-func (b *Vision2SeqBatch) GetSize() int                       { return b.Size }
-func (b *Vision2SeqBatch) GetImages() []image.Image           { return b.Images }
+func (b *Vision2SeqBatch) GetSize() int                           { return b.Size }
+func (b *Vision2SeqBatch) GetImages() []image.Image               { return b.Images }
 func (b *Vision2SeqBatch) GetPreprocessedImages() [][][][]float32 { return b.PreprocessedData }
-func (b *Vision2SeqBatch) SetEncoderHiddenStates(states any)  { b.EncoderHiddenStates = states }
-func (b *Vision2SeqBatch) GetEncoderHiddenStates() any        { return b.EncoderHiddenStates }
-func (b *Vision2SeqBatch) SetPastKeyValues(pkv []any)         { b.PastKeyValues = pkv }
-func (b *Vision2SeqBatch) GetPastKeyValues() []any            { return b.PastKeyValues }
-func (b *Vision2SeqBatch) SetLogits(logits any)               { b.Logits = logits }
-func (b *Vision2SeqBatch) GetLogits() any                     { return b.Logits }
-func (b *Vision2SeqBatch) GetGeneratedTokens() [][]int64      { return b.GeneratedTokens }
-func (b *Vision2SeqBatch) SetGeneratedTokens(tokens [][]int64) { b.GeneratedTokens = tokens }
-func (b *Vision2SeqBatch) GetFinished() []bool                { return b.Finished }
-func (b *Vision2SeqBatch) SetFinished(finished []bool)        { b.Finished = finished }
-func (b *Vision2SeqBatch) GetFinishedCount() int              { return b.FinishedCount }
-func (b *Vision2SeqBatch) SetFinishedCount(count int)         { b.FinishedCount = count }
-func (b *Vision2SeqBatch) SetDestroyEncoder(fn func() error)  { b.DestroyEncoder = fn }
-func (b *Vision2SeqBatch) SetDestroyDecoder(fn func() error)  { b.DestroyDecoder = fn }
-func (b *Vision2SeqBatch) GetPromptTokenIDs() [][]int64       { return b.PromptTokenIDs }
-func (b *Vision2SeqBatch) SetPromptTokenIDs(tokens [][]int64) { b.PromptTokenIDs = tokens }
+func (b *Vision2SeqBatch) SetEncoderHiddenStates(states any)      { b.EncoderHiddenStates = states }
+func (b *Vision2SeqBatch) GetEncoderHiddenStates() any            { return b.EncoderHiddenStates }
+func (b *Vision2SeqBatch) SetPastKeyValues(pkv []any)             { b.PastKeyValues = pkv }
+func (b *Vision2SeqBatch) GetPastKeyValues() []any                { return b.PastKeyValues }
+func (b *Vision2SeqBatch) SetLogits(logits any)                   { b.Logits = logits }
+func (b *Vision2SeqBatch) GetLogits() any                         { return b.Logits }
+func (b *Vision2SeqBatch) GetGeneratedTokens() [][]int64          { return b.GeneratedTokens }
+func (b *Vision2SeqBatch) SetGeneratedTokens(tokens [][]int64)    { b.GeneratedTokens = tokens }
+func (b *Vision2SeqBatch) GetFinished() []bool                    { return b.Finished }
+func (b *Vision2SeqBatch) SetFinished(finished []bool)            { b.Finished = finished }
+func (b *Vision2SeqBatch) GetFinishedCount() int                  { return b.FinishedCount }
+func (b *Vision2SeqBatch) SetFinishedCount(count int)             { b.FinishedCount = count }
+func (b *Vision2SeqBatch) SetDestroyEncoder(fn func() error)      { b.DestroyEncoder = fn }
+func (b *Vision2SeqBatch) SetDestroyDecoder(fn func() error)      { b.DestroyDecoder = fn }
+func (b *Vision2SeqBatch) GetPromptTokenIDs() [][]int64           { return b.PromptTokenIDs }
+func (b *Vision2SeqBatch) SetPromptTokenIDs(tokens [][]int64)     { b.PromptTokenIDs = tokens }
