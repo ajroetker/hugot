@@ -12,7 +12,7 @@ import (
 )
 
 // Vision2SeqPipelineInterface defines the interface for vision-to-sequence pipeline access.
-// This is used by encoder-decoder models like TrOCR where input is an image and output is text.
+// This is used by encoder-decoder models like TrOCR, Donut, and Nougat where input is an image and output is text.
 type Vision2SeqPipelineInterface interface {
 	GetEncoderModel() *Model
 	GetDecoderModel() *Model
@@ -31,8 +31,12 @@ type Vision2SeqPipelineInterface interface {
 	GetPadTokenID() int64
 	GetVocabSize() int
 	GetImageSize() int
+	GetImageWidth() int  // For non-square images (Donut, Nougat)
+	GetImageHeight() int // For non-square images (Donut, Nougat)
 	GetNumHeads() int
 	GetHeadDim() int
+	GetModelType() string    // "trocr", "donut", "nougat"
+	GetOutputFormat() string // "text", "json", "markdown"
 }
 
 // Vision2SeqBatchInterface defines the interface for vision2seq batch access.
@@ -54,13 +58,20 @@ type Vision2SeqBatchInterface interface {
 	SetFinishedCount(count int)
 	SetDestroyEncoder(fn func() error)
 	SetDestroyDecoder(fn func() error)
+	// Prompt support for DocVQA and other task-prompted models
+	GetPromptTokenIDs() [][]int64
+	SetPromptTokenIDs(tokens [][]int64)
 }
 
-// Vision2SeqConfig holds configuration for vision-to-sequence models (TrOCR, etc.).
+// Vision2SeqConfig holds configuration for vision-to-sequence models (TrOCR, Donut, Nougat, etc.).
 type Vision2SeqConfig struct {
 	// Vision encoder config
 	ImageSize   int
 	NumChannels int
+
+	// Extended dimensions for non-square images (Donut, Nougat)
+	ImageWidth  int // For non-square images (default: ImageSize)
+	ImageHeight int // For non-square images (default: ImageSize)
 
 	// Decoder config
 	DecoderStartTokenID int64
@@ -69,14 +80,26 @@ type Vision2SeqConfig struct {
 	VocabSize           int
 
 	// Model architecture
-	HiddenSize       int
-	NumDecoderLayers int
-	NumHeads         int
-	HeadDim          int
+	HiddenSize            int
+	NumDecoderLayers      int
+	NumHeads              int
+	HeadDim               int
+	MaxPositionEmbeddings int // Max output length (Nougat: 4096, TrOCR: ~512)
 
 	// Image preprocessing (from preprocessor_config.json)
 	ImageMean []float32 // Per-channel normalization mean
 	ImageStd  []float32 // Per-channel normalization std
+
+	// Preprocessing flags (from preprocessor_config.json)
+	DoAlignLongAxis bool    // Rotate to portrait orientation (Donut)
+	DoPad           bool    // Pad to target size
+	DoCropMargin    bool    // Remove document margins (Nougat)
+	DoThumbnail     bool    // Create thumbnail (Donut)
+	PadValue        float32 // Background color for padding (default: 1.0 = white)
+
+	// Model type detection
+	ModelType    string // "trocr", "donut", "nougat", "auto"
+	OutputFormat string // "text", "json", "markdown"
 }
 
 // Vision encoder standard input/output names (TrOCR, etc.)
@@ -407,6 +430,7 @@ func LoadVision2SeqTokenizer(modelPath string, opts *options.Options) (*Tokenize
 // LoadVision2SeqConfig loads the model configuration from config.json.
 // TrOCR models have a nested structure with vision_config and text_config.
 // Also loads generation_config.json for token IDs if not found in config.json.
+// Supports TrOCR, Donut, and Nougat model types.
 func LoadVision2SeqConfig(modelPath string) (*Vision2SeqConfig, error) {
 	configPath := fileutil.PathJoinSafe(modelPath, "config.json")
 
@@ -429,26 +453,19 @@ func LoadVision2SeqConfig(modelPath string) (*Vision2SeqConfig, error) {
 	}
 
 	config := &Vision2SeqConfig{
-		EosTokenIDs: make(map[int64]bool),
-		ImageSize:   384, // Default for TrOCR
-		NumChannels: 3,
+		EosTokenIDs:  make(map[int64]bool),
+		ImageSize:    384, // Default for TrOCR
+		NumChannels:  3,
+		PadValue:     1.0,          // White padding by default
+		ModelType:    "auto",       // Auto-detect
+		OutputFormat: "text",       // Plain text by default
 	}
 
-	// Parse encoder config for image dimensions
+	// Parse encoder config for image dimensions and detect model type
 	if encoderConfig, ok := configMap["encoder"].(map[string]any); ok {
-		if v, ok := encoderConfig["image_size"].(float64); ok {
-			config.ImageSize = int(v)
-		}
-		if v, ok := encoderConfig["num_channels"].(float64); ok {
-			config.NumChannels = int(v)
-		}
+		parseEncoderConfig(encoderConfig, config, modelPath)
 	} else if visionConfig, ok := configMap["vision_config"].(map[string]any); ok {
-		if v, ok := visionConfig["image_size"].(float64); ok {
-			config.ImageSize = int(v)
-		}
-		if v, ok := visionConfig["num_channels"].(float64); ok {
-			config.NumChannels = int(v)
-		}
+		parseEncoderConfig(visionConfig, config, modelPath)
 	} else if v, ok := configMap["image_size"].(float64); ok {
 		// Flat config format
 		config.ImageSize = int(v)
@@ -511,7 +528,7 @@ func LoadVision2SeqConfig(modelPath string) (*Vision2SeqConfig, error) {
 		}
 	}
 
-	// Load preprocessor_config.json for image normalization parameters
+	// Load preprocessor_config.json for image normalization parameters and preprocessing flags
 	preprocPath := fileutil.PathJoinSafe(modelPath, "preprocessor_config.json")
 	if exists, _ := fileutil.FileExists(preprocPath); exists {
 		preprocBytes, err := fileutil.ReadFileBytes(preprocPath)
@@ -539,11 +556,57 @@ func LoadVision2SeqConfig(modelPath string) (*Vision2SeqConfig, error) {
 				// Override image size if specified
 				if sizeRaw, ok := preprocConfig["size"].(map[string]any); ok {
 					if h, ok := sizeRaw["height"].(float64); ok {
-						config.ImageSize = int(h)
+						config.ImageHeight = int(h)
+						if config.ImageHeight > config.ImageSize {
+							config.ImageSize = config.ImageHeight
+						}
 					}
+					if w, ok := sizeRaw["width"].(float64); ok {
+						config.ImageWidth = int(w)
+						if config.ImageWidth > config.ImageSize {
+							config.ImageSize = config.ImageWidth
+						}
+					}
+				} else if sizeArr, ok := preprocConfig["size"].([]any); ok {
+					// [height, width] array format
+					if len(sizeArr) >= 2 {
+						if h, ok := sizeArr[0].(float64); ok {
+							config.ImageHeight = int(h)
+						}
+						if w, ok := sizeArr[1].(float64); ok {
+							config.ImageWidth = int(w)
+						}
+						if config.ImageHeight > config.ImageWidth {
+							config.ImageSize = config.ImageHeight
+						} else {
+							config.ImageSize = config.ImageWidth
+						}
+					}
+				}
+
+				// Parse preprocessing flags
+				if v, ok := preprocConfig["do_align_long_axis"].(bool); ok {
+					config.DoAlignLongAxis = v
+				}
+				if v, ok := preprocConfig["do_pad"].(bool); ok {
+					config.DoPad = v
+				}
+				if v, ok := preprocConfig["do_crop_margin"].(bool); ok {
+					config.DoCropMargin = v
+				}
+				if v, ok := preprocConfig["do_thumbnail"].(bool); ok {
+					config.DoThumbnail = v
 				}
 			}
 		}
+	}
+
+	// Set sensible defaults for image dimensions if not set
+	if config.ImageWidth == 0 {
+		config.ImageWidth = config.ImageSize
+	}
+	if config.ImageHeight == 0 {
+		config.ImageHeight = config.ImageSize
 	}
 
 	return config, nil
@@ -613,8 +676,86 @@ func parseDecoderConfig(cfg map[string]any, config *Vision2SeqConfig) {
 		config.NumHeads = int(v)
 	}
 
+	// Max position embeddings (important for Nougat's long sequences)
+	if v, ok := cfg["max_position_embeddings"].(float64); ok {
+		config.MaxPositionEmbeddings = int(v)
+	}
+
 	if config.HiddenSize > 0 && config.NumHeads > 0 {
 		config.HeadDim = config.HiddenSize / config.NumHeads
+	}
+}
+
+// parseEncoderConfig extracts encoder configuration and detects model type.
+func parseEncoderConfig(cfg map[string]any, config *Vision2SeqConfig, modelPath string) {
+	// Extract image size (can be int or [height, width] array)
+	if v, ok := cfg["image_size"].(float64); ok {
+		config.ImageSize = int(v)
+		config.ImageWidth = int(v)
+		config.ImageHeight = int(v)
+	} else if sizeArr, ok := cfg["image_size"].([]any); ok {
+		// [height, width] format used by Donut/Nougat
+		if len(sizeArr) >= 2 {
+			if h, ok := sizeArr[0].(float64); ok {
+				config.ImageHeight = int(h)
+			}
+			if w, ok := sizeArr[1].(float64); ok {
+				config.ImageWidth = int(w)
+			}
+			// Set ImageSize to max dimension for compatibility
+			if config.ImageHeight > config.ImageWidth {
+				config.ImageSize = config.ImageHeight
+			} else {
+				config.ImageSize = config.ImageWidth
+			}
+		}
+	}
+
+	if v, ok := cfg["num_channels"].(float64); ok {
+		config.NumChannels = int(v)
+	}
+
+	// Detect model type from encoder model_type
+	if modelType, ok := cfg["model_type"].(string); ok {
+		switch modelType {
+		case "donut-swin":
+			config.ModelType = "donut"
+			config.OutputFormat = "json"
+			config.DoAlignLongAxis = true
+			config.DoPad = true
+		case "swin", "swinv2":
+			// Could be Nougat or similar - check path for hints
+			if strings.Contains(strings.ToLower(modelPath), "nougat") {
+				config.ModelType = "nougat"
+				config.OutputFormat = "markdown"
+				config.DoCropMargin = true
+				config.DoPad = true
+			} else {
+				// Default to donut-like behavior for swin encoders
+				config.ModelType = "donut"
+				config.OutputFormat = "json"
+				config.DoPad = true
+			}
+		case "vit", "deit", "beit":
+			config.ModelType = "trocr"
+			config.OutputFormat = "text"
+		default:
+			// Try to detect from path
+			pathLower := strings.ToLower(modelPath)
+			if strings.Contains(pathLower, "trocr") {
+				config.ModelType = "trocr"
+				config.OutputFormat = "text"
+			} else if strings.Contains(pathLower, "donut") {
+				config.ModelType = "donut"
+				config.OutputFormat = "json"
+				config.DoPad = true
+			} else if strings.Contains(pathLower, "nougat") {
+				config.ModelType = "nougat"
+				config.OutputFormat = "markdown"
+				config.DoCropMargin = true
+				config.DoPad = true
+			}
+		}
 	}
 }
 
@@ -680,6 +821,10 @@ type Vision2SeqBatch struct {
 	PastKeyValues []any // List of KV cache tensors
 	Logits        any
 
+	// Prompt token IDs for task-prompted models (DocVQA, etc.)
+	// PromptTokenIDs[i] contains the prompt tokens for image i
+	PromptTokenIDs [][]int64
+
 	// Generation tracking
 	GeneratedTokens [][]int64
 	Finished        []bool
@@ -725,3 +870,5 @@ func (b *Vision2SeqBatch) GetFinishedCount() int              { return b.Finishe
 func (b *Vision2SeqBatch) SetFinishedCount(count int)         { b.FinishedCount = count }
 func (b *Vision2SeqBatch) SetDestroyEncoder(fn func() error)  { b.DestroyEncoder = fn }
 func (b *Vision2SeqBatch) SetDestroyDecoder(fn func() error)  { b.DestroyDecoder = fn }
+func (b *Vision2SeqBatch) GetPromptTokenIDs() [][]int64       { return b.PromptTokenIDs }
+func (b *Vision2SeqBatch) SetPromptTokenIDs(tokens [][]int64) { b.PromptTokenIDs = tokens }

@@ -53,49 +53,52 @@ func runVision2SeqEncoderORT(batch Vision2SeqBatchInterface, model *Model) error
 		return fmt.Errorf("creating pixel_values tensor: %w", err)
 	}
 
-	// Find output shape from model metadata
-	// Vision encoder output is typically (batch, seq_len, hidden_size)
-	var seqLen, hiddenSize int64 = 577, 768 // Defaults for ViT-base (14x14 patches + CLS = 197, but TrOCR uses different)
-	for _, meta := range model.OutputsMeta {
-		if strings.Contains(meta.Name, "hidden_states") || meta.Name == "last_hidden_state" {
-			dims := meta.Dimensions
-			if len(dims) >= 3 {
-				if dims[1] != -1 {
-					seqLen = dims[1]
-				}
-				if dims[2] != -1 {
-					hiddenSize = dims[2]
-				}
+	// Create output tensor slice - DynamicAdvancedSession will allocate tensors automatically.
+	// This avoids needing to pre-compute output dimensions which vary by encoder architecture.
+	inputs := []ort.Value{pixelValuesTensor}
+	outputs := make([]ort.Value, len(model.OutputsMeta))
+
+	// Run encoder - ORT allocates output tensors dynamically based on actual model output shape
+	if err := model.ORTModel.Session.Run(inputs, outputs); err != nil {
+		pixelValuesTensor.Destroy()
+		for _, o := range outputs {
+			if o != nil {
+				o.Destroy()
 			}
+		}
+		return fmt.Errorf("running vision encoder: %w", err)
+	}
+
+	// Find and validate the encoder hidden states output
+	var outputTensor ort.Value
+	for i, meta := range model.OutputsMeta {
+		if strings.Contains(meta.Name, "hidden_states") || meta.Name == "last_hidden_state" {
+			outputTensor = outputs[i]
 			break
 		}
 	}
-
-	// Create output tensor
-	outputShape := ort.NewShape(int64(batchSize), seqLen, hiddenSize)
-	outputTensor, err := ort.NewEmptyTensor[float32](outputShape)
-	if err != nil {
-		pixelValuesTensor.Destroy()
-		return fmt.Errorf("creating output tensor: %w", err)
+	if outputTensor == nil && len(outputs) > 0 {
+		// Fallback to first output if no named match
+		outputTensor = outputs[0]
 	}
-
-	// Run encoder
-	inputs := []ort.Value{pixelValuesTensor}
-	outputs := []ort.Value{outputTensor}
-
-	if err := model.ORTModel.Session.Run(inputs, outputs); err != nil {
+	if outputTensor == nil {
 		pixelValuesTensor.Destroy()
-		outputTensor.Destroy()
-		return fmt.Errorf("running vision encoder: %w", err)
+		return errors.New("no encoder output tensor produced")
 	}
 
 	// Store encoder outputs in batch (keep tensors alive for decoder)
 	batch.SetEncoderHiddenStates(outputTensor)
 
-	// Set cleanup function
+	// Set cleanup function - destroy input tensor and any extra outputs
 	batch.SetDestroyEncoder(func() error {
 		var errs []error
 		errs = append(errs, pixelValuesTensor.Destroy())
+		// Destroy any outputs that aren't the main hidden states (in case there are multiple)
+		for _, o := range outputs {
+			if o != nil && o != outputTensor {
+				errs = append(errs, o.Destroy())
+			}
+		}
 		// outputTensor is destroyed after generation
 		return errors.Join(errs...)
 	})
@@ -179,16 +182,110 @@ func runVision2SeqGenerationORT(batch Vision2SeqBatchInterface, pipeline Vision2
 	// For split decoders, encoder PKV is computed once and reused
 	var encoderPKV []ort.Value // Kept separately for split decoder
 
+	// Prompt prefill phase: process prompt tokens if present
+	// For DocVQA, the prompt is like: <s_docvqa><s_question>What is...?</s_question><s_answer>
+	promptTokenIDs := batch.GetPromptTokenIDs()
+	promptLength := 0
+	if len(promptTokenIDs) > 0 && len(promptTokenIDs[0]) > 0 {
+		promptLength = len(promptTokenIDs[0])
+
+		// Feed prompt tokens through decoder to build up past key values
+		for promptIdx := 0; promptIdx < promptLength; promptIdx++ {
+			// Get current prompt token for each batch item
+			for i := 0; i < batchSize; i++ {
+				if promptIdx < len(promptTokenIDs[i]) {
+					decoderInputIDs[i] = promptTokenIDs[i][promptIdx]
+				}
+			}
+
+			var logits []float32
+			var newPKV []ort.Value
+			var err error
+
+			if promptIdx == 0 {
+				// First prompt token: no past_key_values
+				if useSplitDecoder {
+					logits, newPKV, err = runVision2SeqDecoderInitSplitORT(
+						decoderInputIDs, encoderHiddenStates,
+						decoderInitModel, batchSize, vocabSize, numHeads, headDim,
+					)
+					if err == nil {
+						pastKeyValues = make([]ort.Value, 0, len(newPKV)/2)
+						encoderPKV = make([]ort.Value, 0, len(newPKV)/2)
+						for i := 0; i < len(newPKV); i += 4 {
+							pastKeyValues = append(pastKeyValues, newPKV[i], newPKV[i+1])
+							encoderPKV = append(encoderPKV, newPKV[i+2], newPKV[i+3])
+						}
+					}
+				} else {
+					logits, newPKV, err = runVision2SeqDecoderInitORT(
+						decoderInputIDs, encoderHiddenStates,
+						mergedDecoderModel, batchSize, vocabSize, numHeads, headDim,
+					)
+					pastKeyValues = newPKV
+				}
+			} else {
+				// Subsequent prompt tokens: with past_key_values
+				if useSplitDecoder {
+					fullPKV := make([]ort.Value, 0, len(pastKeyValues)+len(encoderPKV))
+					for i := 0; i < len(pastKeyValues); i += 2 {
+						fullPKV = append(fullPKV, pastKeyValues[i], pastKeyValues[i+1])
+						fullPKV = append(fullPKV, encoderPKV[i], encoderPKV[i+1])
+					}
+
+					var decoderPKV []ort.Value
+					logits, decoderPKV, err = runVision2SeqDecoderStepSplitORT(
+						decoderInputIDs, encoderHiddenStates, fullPKV,
+						decoderWithPastModel, batchSize, vocabSize, promptIdx, numHeads, headDim,
+					)
+
+					for _, pkv := range pastKeyValues {
+						pkv.Destroy()
+					}
+					pastKeyValues = decoderPKV
+				} else {
+					logits, newPKV, err = runVision2SeqDecoderStepORT(
+						decoderInputIDs, encoderHiddenStates, pastKeyValues,
+						mergedDecoderModel, batchSize, vocabSize, promptIdx, numHeads, headDim,
+					)
+
+					for _, pkv := range pastKeyValues {
+						pkv.Destroy()
+					}
+					pastKeyValues = newPKV
+				}
+			}
+
+			if err != nil {
+				for _, pkv := range pastKeyValues {
+					pkv.Destroy()
+				}
+				for _, pkv := range encoderPKV {
+					pkv.Destroy()
+				}
+				return fmt.Errorf("prompt prefill step %d: %w", promptIdx, err)
+			}
+
+			// Discard logits during prefill (we don't need them)
+			_ = logits
+		}
+	}
+
+	// Main generation loop (after any prompt prefill)
 	for step := 0; step < maxNewTokens; step++ {
 		if finishedCount == batchSize {
 			break
 		}
 
+		// effectiveStep accounts for prompt tokens already processed
+		effectiveStep := step + promptLength
+
 		var logits []float32
 		var newPKV []ort.Value
 		var err error
 
-		if step == 0 {
+		// Use init decoder only on first step with no prior prefill
+		if step == 0 && promptLength == 0 {
 			// First step: no past_key_values
 			if useSplitDecoder {
 				logits, newPKV, err = runVision2SeqDecoderInitSplitORT(
@@ -213,7 +310,7 @@ func runVision2SeqGenerationORT(batch Vision2SeqBatchInterface, pipeline Vision2
 				pastKeyValues = newPKV
 			}
 		} else {
-			// Subsequent steps: with past_key_values
+			// Subsequent steps or steps after prompt prefill: with past_key_values
 			if useSplitDecoder {
 				// Build full PKV by interleaving decoder and encoder
 				fullPKV := make([]ort.Value, 0, len(pastKeyValues)+len(encoderPKV))
@@ -225,7 +322,7 @@ func runVision2SeqGenerationORT(batch Vision2SeqBatchInterface, pipeline Vision2
 				var decoderPKV []ort.Value
 				logits, decoderPKV, err = runVision2SeqDecoderStepSplitORT(
 					decoderInputIDs, encoderHiddenStates, fullPKV,
-					decoderWithPastModel, batchSize, vocabSize, step, numHeads, headDim,
+					decoderWithPastModel, batchSize, vocabSize, effectiveStep, numHeads, headDim,
 				)
 
 				// Destroy old decoder PKV only (encoder PKV is reused)
@@ -236,7 +333,7 @@ func runVision2SeqGenerationORT(batch Vision2SeqBatchInterface, pipeline Vision2
 			} else {
 				logits, newPKV, err = runVision2SeqDecoderStepORT(
 					decoderInputIDs, encoderHiddenStates, pastKeyValues,
-					mergedDecoderModel, batchSize, vocabSize, step, numHeads, headDim,
+					mergedDecoderModel, batchSize, vocabSize, effectiveStep, numHeads, headDim,
 				)
 
 				// Destroy old PKV

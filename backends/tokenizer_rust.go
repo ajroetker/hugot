@@ -123,3 +123,17 @@ func allInputTokensRust(pipeline *BasePipeline) {
 		tokenizers.WithReturnOffsets(),
 	)
 }
+
+// EncodePromptRust encodes a text prompt using the Rust tokenizer and returns token IDs.
+func EncodePromptRust(tk *Tokenizer, prompt string) ([]int64, error) {
+	if tk.RustTokenizer == nil {
+		return nil, errors.New("Rust tokenizer not initialized")
+	}
+	// Use EncodeWithOptions to get the full encoding with IDs
+	output := tk.RustTokenizer.Tokenizer.EncodeWithOptions(prompt, true)
+	tokenIDs := make([]int64, len(output.IDs))
+	for i, id := range output.IDs {
+		tokenIDs[i] = int64(id)
+	}
+	return tokenIDs, nil
+}

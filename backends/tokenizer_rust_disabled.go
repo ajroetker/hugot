@@ -17,3 +17,8 @@ func decodeRust(_ []uint32, _ *Tokenizer, _ bool) string {
 }
 
 func allInputTokensRust(_ *BasePipeline) {}
+
+// EncodePromptRust is a stub when Rust tokenizer is disabled.
+func EncodePromptRust(_ *Tokenizer, _ string) ([]int64, error) {
+	return nil, errors.New("Rust tokenizer is not enabled")
+}

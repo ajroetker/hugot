@@ -41,3 +41,8 @@ func createORTGenerativeSession(_ *Model, _ *options.Options) error {
 func CreateMessagesORT(_ *PipelineBatch, _ *Model, _ any) error {
 	return errors.New("ORT is not enabled")
 }
+
+// CreateORTModelBackendWithNames is a stub when ORT is disabled.
+func CreateORTModelBackendWithNames(_ *Model, _ *options.Options, _, _ []string) error {
+	return errors.New("ORT is not enabled")
+}

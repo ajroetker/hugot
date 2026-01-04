@@ -70,9 +70,15 @@ type Vision2SeqPipeline struct {
 	// Model dimensions
 	VocabSize        int
 	ImageSize        int
+	ImageWidth       int // For non-square images (Donut, Nougat)
+	ImageHeight      int // For non-square images (Donut, Nougat)
 	NumHeads         int
 	HeadDim          int
 	NumDecoderLayers int
+
+	// Model type detection
+	ModelType    string // "trocr", "donut", "nougat"
+	OutputFormat string // "text", "json", "markdown"
 
 	// Image preprocessing
 	imageFormat        string
@@ -96,6 +102,8 @@ type Vision2SeqOutput struct {
 	GeneratedTexts []string
 	// GeneratedTokens[i] is the token IDs for GeneratedTexts[i]
 	GeneratedTokens [][]uint32
+	// OutputFormat indicates the expected format: "text", "json", or "markdown"
+	OutputFormat string
 }
 
 // GetOutput implements backends.PipelineBatchOutput interface.
@@ -174,18 +182,17 @@ func NewVision2SeqPipeline(
 		}
 	}
 
-	// Load models
+	// Load models (this also calls loadConfig which sets up preprocessing)
 	if err := pipeline.loadModels(config.ModelPath, opts); err != nil {
 		return nil, fmt.Errorf("loading models: %w", err)
 	}
 
-	// Set default preprocessing steps.
-	// ResizeToExactStep is used instead of ResizeStep because vision encoders
-	// (like TrOCR's ViT) require exact input dimensions. ResizeStep preserves
-	// aspect ratio which would produce non-square images.
+	// Set default preprocessing if not set by loadConfig.
+	// ResizeToExactStep is used for TrOCR because ViT requires exact input dimensions.
+	// For Donut/Nougat, loadConfig sets PadToSize which preserves aspect ratio.
 	if len(pipeline.preprocessSteps) == 0 {
 		pipeline.preprocessSteps = []imageutil.PreprocessStep{
-			imageutil.ResizeToExactStep(pipeline.ImageSize, pipeline.ImageSize),
+			imageutil.ResizeToExactStep(pipeline.GetImageWidth(), pipeline.GetImageHeight()),
 		}
 	}
 	if len(pipeline.normalizationSteps) == 0 {
@@ -265,9 +272,23 @@ func (p *Vision2SeqPipeline) loadConfig(modelPath string) error {
 	p.HeadDim = config.HeadDim
 	p.NumDecoderLayers = config.NumDecoderLayers
 
-	// Override image size if not set by user
+	// Set model type and output format from auto-detection
+	if config.ModelType != "" {
+		p.ModelType = config.ModelType
+	}
+	if config.OutputFormat != "" {
+		p.OutputFormat = config.OutputFormat
+	}
+
+	// Override image dimensions if not set by user
 	if config.ImageSize > 0 && p.ImageSize == 384 {
 		p.ImageSize = config.ImageSize
+	}
+	if config.ImageWidth > 0 {
+		p.ImageWidth = config.ImageWidth
+	}
+	if config.ImageHeight > 0 {
+		p.ImageHeight = config.ImageHeight
 	}
 
 	// Set normalization from preprocessor config if available
@@ -281,7 +302,47 @@ func (p *Vision2SeqPipeline) loadConfig(modelPath string) error {
 		}
 	}
 
+	// Build model-specific preprocessing steps
+	p.buildPreprocessSteps(config)
+
 	return nil
+}
+
+// buildPreprocessSteps creates preprocessing steps based on model type and config flags.
+func (p *Vision2SeqPipeline) buildPreprocessSteps(config *backends.Vision2SeqConfig) {
+	var steps []imageutil.PreprocessStep
+
+	// Donut/Nougat: optional margin cropping
+	if config.DoCropMargin {
+		steps = append(steps, imageutil.CropMarginStep(250, 0))
+	}
+
+	// Donut: align long axis to portrait
+	if config.DoAlignLongAxis {
+		steps = append(steps, imageutil.AlignLongAxisStep())
+	}
+
+	// Determine target dimensions
+	targetWidth := p.GetImageWidth()
+	targetHeight := p.GetImageHeight()
+
+	// Donut/Nougat: pad to target size (preserves aspect ratio)
+	// TrOCR: resize to exact size (stretches/squashes)
+	if config.DoPad {
+		padValue := config.PadValue
+		if padValue == 0 {
+			padValue = 1.0 // white background default
+		}
+		steps = append(steps, imageutil.PadToSizeStep(targetWidth, targetHeight, padValue))
+	} else {
+		// Default resize for TrOCR-style models
+		steps = append(steps, imageutil.ResizeToExactStep(targetWidth, targetHeight))
+	}
+
+	// Only set if we built model-specific steps
+	if len(steps) > 0 {
+		p.preprocessSteps = steps
+	}
 }
 
 // Validate checks that the pipeline is correctly configured.
@@ -401,6 +462,100 @@ func (p *Vision2SeqPipeline) RunWithImagePaths(paths []string) (*Vision2SeqOutpu
 	return p.RunWithImages(images)
 }
 
+// RunWithPrompt runs the pipeline with a text prompt that conditions generation.
+// This is used for task-prompted models like Donut where the decoder is guided
+// by a prompt specifying the task (e.g., document parsing, VQA).
+//
+// The prompt is tokenized and fed through the decoder before generation begins,
+// allowing the model to generate continuations conditioned on the prompt.
+//
+// Example usage for DocVQA:
+//
+//	prompt := "<s_docvqa><s_question>What is the total?</s_question><s_answer>"
+//	output, err := pipeline.RunWithPrompt(images, prompt)
+//
+// Example usage for document parsing:
+//
+//	prompt := "<s_cord-v2>"
+//	output, err := pipeline.RunWithPrompt(images, prompt)
+func (p *Vision2SeqPipeline) RunWithPrompt(images []image.Image, prompt string) (*Vision2SeqOutput, error) {
+	// Tokenize the prompt
+	promptTokens, err := p.encodePrompt(prompt)
+	if err != nil {
+		return nil, fmt.Errorf("encode prompt: %w", err)
+	}
+
+	batch := backends.NewVision2SeqBatch(len(images))
+	batch.Images = images
+	defer batch.Destroy()
+
+	// Set the same prompt for all images in the batch
+	promptTokenIDs := make([][]int64, len(images))
+	for i := range promptTokenIDs {
+		promptTokenIDs[i] = promptTokens
+	}
+	batch.SetPromptTokenIDs(promptTokenIDs)
+
+	// 1. Preprocess images
+	if err := p.Preprocess(batch); err != nil {
+		return nil, fmt.Errorf("preprocess: %w", err)
+	}
+
+	// 2. Run encoder
+	if err := p.Encode(batch); err != nil {
+		return nil, fmt.Errorf("encode: %w", err)
+	}
+
+	// 3. Generate sequences (prompt is processed in generation)
+	if err := p.Generate(batch); err != nil {
+		return nil, fmt.Errorf("generate: %w", err)
+	}
+
+	// 4. Decode tokens to text
+	output, err := p.Postprocess(batch)
+	if err != nil {
+		return nil, fmt.Errorf("postprocess: %w", err)
+	}
+
+	return output, nil
+}
+
+// encodePrompt tokenizes a text prompt and returns the token IDs.
+func (p *Vision2SeqPipeline) encodePrompt(prompt string) ([]int64, error) {
+	if p.Tokenizer == nil {
+		return nil, errors.New("tokenizer not loaded")
+	}
+
+	// Use the tokenizer to encode the prompt
+	var tokenIDs []int64
+
+	switch p.Tokenizer.Runtime {
+	case "GO":
+		if p.Tokenizer.GoTokenizer == nil {
+			return nil, errors.New("Go tokenizer not initialized")
+		}
+		output, err := p.Tokenizer.GoTokenizer.Tokenizer.EncodeSingle(prompt, true)
+		if err != nil {
+			return nil, fmt.Errorf("encode prompt: %w", err)
+		}
+		tokenIDs = make([]int64, len(output.Ids))
+		for i, id := range output.Ids {
+			tokenIDs[i] = int64(id)
+		}
+	case "RUST":
+		// Rust tokenizer encoding is handled by backends.EncodePromptRust
+		ids, err := backends.EncodePromptRust(p.Tokenizer, prompt)
+		if err != nil {
+			return nil, fmt.Errorf("encode prompt: %w", err)
+		}
+		tokenIDs = ids
+	default:
+		return nil, fmt.Errorf("unsupported tokenizer runtime: %s", p.Tokenizer.Runtime)
+	}
+
+	return tokenIDs, nil
+}
+
 // Preprocess converts images to tensors.
 func (p *Vision2SeqPipeline) Preprocess(batch *backends.Vision2SeqBatch) error {
 	start := time.Now()
@@ -460,6 +615,7 @@ func (p *Vision2SeqPipeline) Postprocess(batch *backends.Vision2SeqBatch) (*Visi
 	output := &Vision2SeqOutput{
 		GeneratedTexts:  make([]string, batch.Size),
 		GeneratedTokens: make([][]uint32, batch.Size),
+		OutputFormat:    p.GetOutputFormat(),
 	}
 
 	for i := 0; i < batch.Size; i++ {
@@ -528,3 +684,31 @@ func (p *Vision2SeqPipeline) GetHeadDim() int                   { return p.HeadD
 func (p *Vision2SeqPipeline) GetDecoderInitModel() *backends.Model     { return p.DecoderInitModel }
 func (p *Vision2SeqPipeline) GetDecoderWithPastModel() *backends.Model { return p.DecoderWithPastModel }
 func (p *Vision2SeqPipeline) UseSplitDecoder() bool                    { return p.useSplitDecoder }
+
+// Non-square image support (Donut, Nougat)
+func (p *Vision2SeqPipeline) GetImageWidth() int {
+	if p.ImageWidth > 0 {
+		return p.ImageWidth
+	}
+	return p.ImageSize
+}
+func (p *Vision2SeqPipeline) GetImageHeight() int {
+	if p.ImageHeight > 0 {
+		return p.ImageHeight
+	}
+	return p.ImageSize
+}
+
+// Model type detection
+func (p *Vision2SeqPipeline) GetModelType() string {
+	if p.ModelType == "" {
+		return "trocr"
+	}
+	return p.ModelType
+}
+func (p *Vision2SeqPipeline) GetOutputFormat() string {
+	if p.OutputFormat == "" {
+		return "text"
+	}
+	return p.OutputFormat
+}
