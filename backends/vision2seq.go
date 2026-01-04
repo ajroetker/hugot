@@ -772,17 +772,19 @@ func findVision2SeqOnnxFile(modelPath string, modelType string) (string, error) 
 	switch modelType {
 	case "encoder":
 		patterns = []string{"encoder_model", "encoder"}
+		excludePatterns = []string{"quantized", "fp16", "int8", "uint8", "bnb4", "q4", "q4f16"}
 	case "decoder":
 		// Prefer merged decoder (single model for both init and subsequent steps)
 		patterns = []string{"decoder_model_merged", "decoder_model", "decoder"}
+		excludePatterns = []string{"quantized", "fp16", "int8", "uint8", "bnb4", "q4", "q4f16"}
 	case "decoder_init":
 		// Init decoder: decoder_model.onnx (not merged, not with_past)
 		patterns = []string{"decoder_model"}
-		excludePatterns = []string{"merged", "with_past", "quantized", "fp16"}
+		excludePatterns = []string{"merged", "with_past", "quantized", "fp16", "int8", "uint8", "bnb4", "q4", "q4f16"}
 	case "decoder_with_past":
 		// Decoder with past: decoder_with_past_model.onnx
 		patterns = []string{"decoder_with_past"}
-		excludePatterns = []string{"quantized", "fp16"}
+		excludePatterns = []string{"quantized", "fp16", "int8", "uint8", "bnb4", "q4", "q4f16"}
 	}
 
 	for _, pattern := range patterns {

@@ -521,6 +521,8 @@ func (p *Vision2SeqPipeline) RunWithPrompt(images []image.Image, prompt string) 
 }
 
 // encodePrompt tokenizes a text prompt and returns the token IDs.
+// For decoder prompts, this strips any trailing EOS token since we're providing
+// a prefix for the model to continue from, not a complete sequence.
 func (p *Vision2SeqPipeline) encodePrompt(prompt string) ([]int64, error) {
 	if p.Tokenizer == nil {
 		return nil, errors.New("tokenizer not loaded")
@@ -551,6 +553,13 @@ func (p *Vision2SeqPipeline) encodePrompt(prompt string) ([]int64, error) {
 		tokenIDs = ids
 	default:
 		return nil, fmt.Errorf("unsupported tokenizer runtime: %s", p.Tokenizer.Runtime)
+	}
+
+	// Strip trailing EOS token(s) from the prompt.
+	// Tokenizers with addSpecialTokens=true add EOS at the end, but for decoder
+	// prompts we want to provide a prefix for the model to continue from.
+	for len(tokenIDs) > 0 && p.EosTokenIDs[tokenIDs[len(tokenIDs)-1]] {
+		tokenIDs = tokenIDs[:len(tokenIDs)-1]
 	}
 
 	return tokenIDs, nil
