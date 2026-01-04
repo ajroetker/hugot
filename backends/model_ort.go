@@ -133,9 +133,27 @@ func runGenerativeORTSessionOnBatch(ctx context.Context, batch *PipelineBatch, p
 		return nil, nil, fmt.Errorf("invalid input type %T for generative ORT session", batch.InputValues)
 	}
 
-	ortTokenStream, ortErrorStream, err := session.Generate(ctx, inputs, &ortgenai.GenerationOptions{MaxLength: maxLength})
-	if err != nil {
-		return nil, nil, fmt.Errorf("error during generation start: %w", err)
+	// Check if we have multimodal tensors to use instead of text tokenization
+	var ortTokenStream <-chan ortgenai.SequenceDelta
+	var ortErrorStream <-chan error
+	var err error
+
+	if batch.MultimodalTensors != nil {
+		// Multimodal path: use named tensors
+		namedTensors, ok := batch.MultimodalTensors.(*ortgenai.NamedTensors)
+		if !ok {
+			return nil, nil, fmt.Errorf("invalid multimodal tensors type %T", batch.MultimodalTensors)
+		}
+		ortTokenStream, ortErrorStream, err = session.GenerateWithTensors(ctx, namedTensors, &ortgenai.GenerationOptions{MaxLength: maxLength, BatchSize: len(inputs)})
+		if err != nil {
+			return nil, nil, fmt.Errorf("error during multimodal generation start: %w", err)
+		}
+	} else {
+		// Text-only path: use messages
+		ortTokenStream, ortErrorStream, err = session.Generate(ctx, inputs, &ortgenai.GenerationOptions{MaxLength: maxLength})
+		if err != nil {
+			return nil, nil, fmt.Errorf("error during generation start: %w", err)
+		}
 	}
 
 	tokenStream := make(chan SequenceDelta, 10)
@@ -193,28 +211,64 @@ func createORTModelBackend(model *Model, options *options.Options) error {
 	}
 
 	sessionOptions := options.BackendOptions.(*ort.SessionOptions)
+	memoryMapped := options.ORTOptions != nil && options.ORTOptions.MemoryMappedLoading
 
-	inputs, outputs, err := loadInputOutputMetaORT(model.OnnxBytes)
-	if err != nil {
-		return err
-	}
+	var inputs, outputs []InputOutputInfo
+	var inputNames, outputNames []string
+	var session *ort.DynamicAdvancedSession
 
-	var inputNames []string
-	var outputNames []string
-	for _, v := range inputs {
-		inputNames = append(inputNames, v.Name)
-	}
-	for _, v := range outputs {
-		outputNames = append(outputNames, v.Name)
-	}
-	session, errSession := ort.NewDynamicAdvancedSessionWithONNXData(
-		model.OnnxBytes,
-		inputNames,
-		outputNames,
-		sessionOptions,
-	)
-	if errSession != nil {
-		return errSession
+	if memoryMapped && model.OnnxPath != "" {
+		// Memory-mapped loading: use file path directly
+		ortInputs, ortOutputs, metaErr := ort.GetInputOutputInfo(model.OnnxPath)
+		if metaErr != nil {
+			return metaErr
+		}
+		inputs = convertORTInputOutputs(ortInputs)
+		outputs = convertORTInputOutputs(ortOutputs)
+
+		for _, v := range inputs {
+			inputNames = append(inputNames, v.Name)
+		}
+		for _, v := range outputs {
+			outputNames = append(outputNames, v.Name)
+		}
+
+		// Create session from file path (memory-mapped)
+		session, err = ort.NewDynamicAdvancedSession(
+			model.OnnxPath,
+			inputNames,
+			outputNames,
+			sessionOptions,
+		)
+		if err != nil {
+			return err
+		}
+	} else {
+		// Traditional loading: use bytes already loaded in memory
+		inputs, outputs, err = loadInputOutputMetaORT(model.OnnxBytes)
+		if err != nil {
+			return err
+		}
+
+		for _, v := range inputs {
+			inputNames = append(inputNames, v.Name)
+		}
+		for _, v := range outputs {
+			outputNames = append(outputNames, v.Name)
+		}
+
+		session, err = ort.NewDynamicAdvancedSessionWithONNXData(
+			model.OnnxBytes,
+			inputNames,
+			outputNames,
+			sessionOptions,
+		)
+		if err != nil {
+			return err
+		}
+
+		// ONNX bytes no longer needed after creating the session
+		model.OnnxBytes = nil
 	}
 
 	model.ORTModel = &ORTModel{
@@ -231,8 +285,6 @@ func createORTModelBackend(model *Model, options *options.Options) error {
 		err = os.Chdir(cwd)
 	}
 
-	// ONNX bytes no longer needed after creating the session
-	model.OnnxBytes = nil
 	return err
 }
 
@@ -519,7 +571,7 @@ func createImageTensorsORT(batch *PipelineBatch, model *Model, preprocessed [][]
 	return nil
 }
 
-func CreateMessagesORT(batch *PipelineBatch, inputs any) error {
+func CreateMessagesORT(batch *PipelineBatch, model *Model, inputs any) error {
 	switch inputs := inputs.(type) {
 	case []string:
 		messages := make([][]ortgenai.Message, len(inputs))
@@ -533,6 +585,18 @@ func CreateMessagesORT(batch *PipelineBatch, inputs any) error {
 		}
 		batch.InputValues = messages
 	case [][]Message:
+		// Check if any messages contain images
+		hasImages := false
+		var allImageURLs []string
+		for _, msgList := range inputs {
+			for _, msg := range msgList {
+				if len(msg.ImageURLs) > 0 {
+					hasImages = true
+					allImageURLs = append(allImageURLs, msg.ImageURLs...)
+				}
+			}
+		}
+
 		ortMessages := make([][]ortgenai.Message, len(inputs))
 		for i, msgList := range inputs {
 			ortMsgList := make([]ortgenai.Message, len(msgList))
@@ -545,6 +609,46 @@ func CreateMessagesORT(batch *PipelineBatch, inputs any) error {
 			ortMessages[i] = ortMsgList
 		}
 		batch.InputValues = ortMessages
+
+		// If multimodal, process images
+		if hasImages {
+			// Load images
+			images, err := ortgenai.LoadImages(allImageURLs)
+			if err != nil {
+				return fmt.Errorf("failed to load images: %w", err)
+			}
+
+			// Create multimodal processor
+			processor, err := ortgenai.CreateMultiModalProcessor(model.ORTModel.GenerativeSession.GetModel())
+			if err != nil {
+				images.Destroy()
+				return fmt.Errorf("failed to create multimodal processor: %w", err)
+			}
+
+			// Combine all text prompts (simplified - using first message content)
+			// In a real implementation, you might want to format this differently
+			prompt := ""
+			if len(inputs) > 0 && len(inputs[0]) > 0 {
+				prompt = inputs[0][0].Content
+			}
+
+			// Process images with prompt
+			tensors, err := processor.ProcessImages(prompt, images)
+			if err != nil {
+				images.Destroy()
+				processor.Destroy()
+				return fmt.Errorf("failed to process images: %w", err)
+			}
+
+			// Store tensors in batch
+			batch.MultimodalTensors = tensors
+			batch.DestroyMultimodal = func() error {
+				tensors.Destroy()
+				processor.Destroy()
+				images.Destroy()
+				return nil
+			}
+		}
 	default:
 		return fmt.Errorf("invalid input type %T for CreateMessagesORT", inputs)
 	}
