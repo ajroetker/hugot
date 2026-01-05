@@ -129,7 +129,7 @@ func LoadVision2SeqEncoder(modelPath string, opts *options.Options) (*Model, err
 		Pipelines:    make(map[string]Pipeline),
 	}
 
-	if err := LoadOnnxModelBytes(model); err != nil {
+	if err := LoadOnnxModelBytes(model, opts); err != nil {
 		return nil, err
 	}
 
@@ -184,7 +184,7 @@ func LoadVision2SeqVisionEncoder(modelPath string, opts *options.Options) (*Mode
 		Pipelines:    make(map[string]Pipeline),
 	}
 
-	if err := LoadOnnxModelBytes(model); err != nil {
+	if err := LoadOnnxModelBytes(model, opts); err != nil {
 		return nil, err
 	}
 
@@ -236,7 +236,7 @@ func LoadVision2SeqEmbedTokens(modelPath string, opts *options.Options) (*Model,
 		Pipelines:    make(map[string]Pipeline),
 	}
 
-	if err := LoadOnnxModelBytes(model); err != nil {
+	if err := LoadOnnxModelBytes(model, opts); err != nil {
 		return nil, err
 	}
 
@@ -288,7 +288,7 @@ func LoadVision2SeqFlorenceEncoder(modelPath string, opts *options.Options) (*Mo
 		Pipelines:    make(map[string]Pipeline),
 	}
 
-	if err := LoadOnnxModelBytes(model); err != nil {
+	if err := LoadOnnxModelBytes(model, opts); err != nil {
 		return nil, err
 	}
 
@@ -488,7 +488,7 @@ func LoadVision2SeqDecoderInit(modelPath string, opts *options.Options, numDecod
 		Pipelines:    make(map[string]Pipeline),
 	}
 
-	if err := LoadOnnxModelBytes(model); err != nil {
+	if err := LoadOnnxModelBytes(model, opts); err != nil {
 		return nil, err
 	}
 
@@ -543,7 +543,7 @@ func LoadVision2SeqDecoderWithPast(modelPath string, opts *options.Options, numD
 		Pipelines:    make(map[string]Pipeline),
 	}
 
-	if err := LoadOnnxModelBytes(model); err != nil {
+	if err := LoadOnnxModelBytes(model, opts); err != nil {
 		return nil, err
 	}
 
@@ -600,7 +600,7 @@ func LoadVision2SeqFlorenceDecoderInit(modelPath string, opts *options.Options, 
 		Pipelines:    make(map[string]Pipeline),
 	}
 
-	if err := LoadOnnxModelBytes(model); err != nil {
+	if err := LoadOnnxModelBytes(model, opts); err != nil {
 		return nil, err
 	}
 
@@ -656,7 +656,7 @@ func LoadVision2SeqFlorenceDecoderWithPast(modelPath string, opts *options.Optio
 		Pipelines:    make(map[string]Pipeline),
 	}
 
-	if err := LoadOnnxModelBytes(model); err != nil {
+	if err := LoadOnnxModelBytes(model, opts); err != nil {
 		return nil, err
 	}
 
@@ -744,7 +744,7 @@ func LoadVision2SeqFlorenceMergedDecoder(modelPath string, opts *options.Options
 		Pipelines:    make(map[string]Pipeline),
 	}
 
-	if err := LoadOnnxModelBytes(model); err != nil {
+	if err := LoadOnnxModelBytes(model, opts); err != nil {
 		return nil, err
 	}
 
@@ -798,7 +798,7 @@ func LoadVision2SeqDecoder(modelPath string, opts *options.Options, numDecoderLa
 		Pipelines:    make(map[string]Pipeline),
 	}
 
-	if err := LoadOnnxModelBytes(model); err != nil {
+	if err := LoadOnnxModelBytes(model, opts); err != nil {
 		return nil, err
 	}
 

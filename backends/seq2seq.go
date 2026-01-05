@@ -88,7 +88,7 @@ func LoadSeq2SeqEncoder(modelPath string, opts *options.Options) (*Model, error)
 		Pipelines:    make(map[string]Pipeline),
 	}
 
-	if err := LoadOnnxModelBytes(model); err != nil {
+	if err := LoadOnnxModelBytes(model, opts); err != nil {
 		return nil, err
 	}
 
@@ -127,7 +127,7 @@ func LoadSeq2SeqDecoderInit(modelPath string, opts *options.Options) (*Model, er
 		Pipelines:    make(map[string]Pipeline),
 	}
 
-	if err := LoadOnnxModelBytes(model); err != nil {
+	if err := LoadOnnxModelBytes(model, opts); err != nil {
 		return nil, err
 	}
 
@@ -166,7 +166,7 @@ func LoadSeq2SeqDecoder(modelPath string, opts *options.Options) (*Model, error)
 		Pipelines:    make(map[string]Pipeline),
 	}
 
-	if err := LoadOnnxModelBytes(model); err != nil {
+	if err := LoadOnnxModelBytes(model, opts); err != nil {
 		return nil, err
 	}
 
