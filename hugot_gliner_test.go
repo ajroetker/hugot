@@ -600,10 +600,10 @@ func glinerPipelineValidation(t *testing.T, session *Session) {
 	})
 }
 
-// TestGLiNERRuntimeValidation tests that GLiNER rejects non-ORT runtimes
+// TestGLiNERRuntimeValidation tests that GLiNER accepts all runtimes with dynamic shapes support
 func TestGLiNERRuntimeValidation(t *testing.T) {
-	// This test checks that the validation correctly rejects non-ORT runtimes
-	// We create a minimal pipeline struct with just enough to test runtime validation
+	// GLiNER now supports all runtimes (ORT, GO, XLA) with dynamic shapes support in GoMLX v0.27+
+	// See: https://github.com/gomlx/gomlx/pull/264
 
 	// Create a mock model with the required input metadata
 	mockModel := &backends.Model{
@@ -618,8 +618,10 @@ func TestGLiNERRuntimeValidation(t *testing.T) {
 		OutputsMeta: []backends.InputOutputInfo{
 			{Name: "output"},
 		},
+		Tokenizer: &backends.Tokenizer{}, // Required for validation
 	}
 
+	// Test GO runtime is now accepted
 	p := &pipelines.GLiNERPipeline{
 		BasePipeline: &backends.BasePipeline{
 			Runtime: "GO",
@@ -629,8 +631,17 @@ func TestGLiNERRuntimeValidation(t *testing.T) {
 	}
 
 	err := p.Validate()
-	assert.Error(t, err, "Should fail with GO runtime")
-	assert.Contains(t, err.Error(), "ORT backend")
+	assert.NoError(t, err, "GO runtime should now be accepted with dynamic shapes support")
+
+	// Test XLA runtime is also accepted
+	p.BasePipeline.Runtime = "XLA"
+	err = p.Validate()
+	assert.NoError(t, err, "XLA runtime should now be accepted with dynamic shapes support")
+
+	// Test ORT runtime still works
+	p.BasePipeline.Runtime = "ORT"
+	err = p.Validate()
+	assert.NoError(t, err, "ORT runtime should still work")
 }
 
 // =============================================================================

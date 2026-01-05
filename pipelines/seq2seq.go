@@ -76,6 +76,16 @@ type Seq2SeqPipeline struct {
 	HeadDim          int
 	DModel           int // Hidden size
 	VocabSize        int
+
+	// Output options
+	SkipSpecialTokens bool // Whether to skip special tokens when decoding (default: true)
+	SkipFirstToken    bool // Whether to skip the first generated token (for T5Gemma2 and similar models)
+
+	// Memory optimization options
+	NoCacheMode bool // If true, skip loading decoder.onnx and use decoder-init.onnx for all steps (saves ~1.7GB RAM)
+
+	// Internal flags for option tracking
+	decoderStartTokenIDSet bool // true if DecoderStartTokenID was set via WithDecoderStartTokenID
 }
 
 // seq2seqTimings tracks timing statistics for seq2seq pipeline components.
@@ -164,11 +174,17 @@ func WithSeq2SeqMaxTokens(maxTokens int) backends.PipelineOption[*Seq2SeqPipelin
 
 // WithNumReturnSequences sets how many sequences to generate per input.
 // Use with DoSample=true for diverse outputs.
+//
+// NOTE: This option is currently a placeholder. The current implementation
+// always generates exactly one sequence per input. Multiple sequence generation
+// (e.g., via beam search or multiple sampling runs) is planned for a future release.
+// Setting this to a value > 1 will have no effect on the output.
 func WithNumReturnSequences(n int) backends.PipelineOption[*Seq2SeqPipeline] {
 	return func(p *Seq2SeqPipeline) error {
 		if n <= 0 {
 			return errors.New("numReturnSequences must be positive")
 		}
+		// TODO: Implement multiple sequence generation (beam search or multiple sampling runs)
 		p.NumReturnSeqs = n
 		return nil
 	}
@@ -204,6 +220,49 @@ func WithRepetitionPenalty(penalty float32) backends.PipelineOption[*Seq2SeqPipe
 	}
 }
 
+// WithSkipSpecialTokens sets whether to skip special tokens when decoding output.
+// Default is true. Set to false to preserve special tokens like <triplet>, <subj>, etc.
+// This is useful for models like REBEL that use special tokens to structure output.
+func WithSkipSpecialTokens(skip bool) backends.PipelineOption[*Seq2SeqPipeline] {
+	return func(p *Seq2SeqPipeline) error {
+		p.SkipSpecialTokens = skip
+		return nil
+	}
+}
+
+// WithSkipFirstToken sets whether to skip the first generated token.
+// This is needed for T5Gemma2 and similar models where the first token is garbage
+// due to decoder_start_token_id being None in the model config.
+// When enabled, the first generated token is removed from the output.
+func WithSkipFirstToken(skip bool) backends.PipelineOption[*Seq2SeqPipeline] {
+	return func(p *Seq2SeqPipeline) error {
+		p.SkipFirstToken = skip
+		return nil
+	}
+}
+
+// WithDecoderStartTokenID sets the decoder start token ID to use for generation.
+// This overrides the value from the model config. Use this when the model's
+// decoder_start_token_id is null/None and the bos_token_id fallback is incorrect.
+func WithDecoderStartTokenID(tokenID int64) backends.PipelineOption[*Seq2SeqPipeline] {
+	return func(p *Seq2SeqPipeline) error {
+		p.DecoderStartTokenID = tokenID
+		p.decoderStartTokenIDSet = true
+		return nil
+	}
+}
+
+// WithNoCacheMode enables no-cache mode which skips loading decoder.onnx.
+// In this mode, only decoder-init.onnx is used for all generation steps.
+// This saves ~1.7GB RAM for large models like T5Gemma-2 at the cost of slower
+// generation (no KV caching). Useful for memory-constrained environments.
+func WithNoCacheMode(enabled bool) backends.PipelineOption[*Seq2SeqPipeline] {
+	return func(p *Seq2SeqPipeline) error {
+		p.NoCacheMode = enabled
+		return nil
+	}
+}
+
 // NewSeq2SeqPipeline creates a new seq2seq pipeline from the given model path.
 // The model path should contain encoder.onnx, decoder-init.onnx, decoder.onnx,
 // tokenizer.json, and config.json files.
@@ -223,16 +282,17 @@ func NewSeq2SeqPipeline(
 		TopP:              0.9,
 		Temperature:       1.0,
 		RepetitionPenalty: 1.0,
+		SkipSpecialTokens: true, // Default to skipping special tokens for backward compatibility
 	}
 
-	// Apply user options
+	// Apply user options BEFORE loading models so NoCacheMode can skip loading decoder.onnx
 	for _, opt := range config.Options {
 		if err := opt(pipeline); err != nil {
 			return nil, fmt.Errorf("applying option: %w", err)
 		}
 	}
 
-	// Load models
+	// Load models (includes loading config)
 	if err := pipeline.loadModels(config.ModelPath, opts); err != nil {
 		return nil, fmt.Errorf("loading models: %w", err)
 	}
@@ -261,10 +321,12 @@ func (p *Seq2SeqPipeline) loadModels(modelPath string, opts *options.Options) er
 		return fmt.Errorf("loading decoder-init: %w", err)
 	}
 
-	// Load decoder (with past_key_values)
-	p.DecoderModel, err = backends.LoadSeq2SeqDecoder(modelPath, opts)
-	if err != nil {
-		return fmt.Errorf("loading decoder: %w", err)
+	// Load decoder (with past_key_values) - skip in NoCacheMode to save ~1.7GB RAM
+	if !p.NoCacheMode {
+		p.DecoderModel, err = backends.LoadSeq2SeqDecoder(modelPath, opts)
+		if err != nil {
+			return fmt.Errorf("loading decoder: %w", err)
+		}
 	}
 
 	// Load shared tokenizer
@@ -288,7 +350,10 @@ func (p *Seq2SeqPipeline) loadConfig(modelPath string) error {
 		return err
 	}
 
-	p.DecoderStartTokenID = config.DecoderStartTokenID
+	// Only set DecoderStartTokenID if not already set by WithDecoderStartTokenID option
+	if !p.decoderStartTokenIDSet {
+		p.DecoderStartTokenID = config.DecoderStartTokenID
+	}
 	p.EosTokenIDs = config.EosTokenIDs
 	p.PadTokenID = config.PadTokenID
 	p.NumDecoderLayers = config.NumDecoderLayers
@@ -310,7 +375,8 @@ func (p *Seq2SeqPipeline) Validate() error {
 	if p.DecoderInitModel == nil {
 		errs = append(errs, errors.New("decoder-init model not loaded"))
 	}
-	if p.DecoderModel == nil {
+	// DecoderModel is optional in NoCacheMode (uses decoder-init for all steps)
+	if p.DecoderModel == nil && !p.NoCacheMode {
 		errs = append(errs, errors.New("decoder model not loaded"))
 	}
 	if p.Tokenizer == nil {
@@ -368,6 +434,10 @@ func (p *Seq2SeqPipeline) Run(inputs []string) (backends.PipelineBatchOutput, er
 
 // RunPipeline is the main entry point for seq2seq generation.
 func (p *Seq2SeqPipeline) RunPipeline(inputs []string) (*Seq2SeqOutput, error) {
+	if len(inputs) == 0 {
+		return nil, errors.New("inputs cannot be empty")
+	}
+
 	batch := NewSeq2SeqBatch(len(inputs))
 	batch.Inputs = inputs
 	defer batch.Destroy()
@@ -459,12 +529,20 @@ func (p *Seq2SeqPipeline) Postprocess(batch *Seq2SeqBatch) (*Seq2SeqOutput, erro
 		// (e.g., beam search or multiple sampling runs) would require changes to
 		// the generation loop to maintain multiple candidate sequences per input.
 		tokens := batch.GeneratedTokens[i]
+
+		// Skip first token if enabled (for T5Gemma2 where first token is garbage)
+		if p.SkipFirstToken && len(tokens) > 0 {
+			tokens = tokens[1:]
+		}
+
 		convertedTokens := make([]uint32, len(tokens))
 		for j, tok := range tokens {
 			convertedTokens[j] = safeconv.Int64ToUint32(tok)
 		}
 
-		text, err := backends.Decode(convertedTokens, p.Tokenizer, true)
+		// Decode tokens to text
+		// Note: SkipSpecialTokens controls whether special tokens like <triplet>, <subj>, <obj> are included
+		text, err := backends.Decode(convertedTokens, p.Tokenizer, p.SkipSpecialTokens)
 		if err != nil {
 			return nil, fmt.Errorf("decoding output %d: %w", i, err)
 		}
@@ -530,6 +608,7 @@ func (p *Seq2SeqPipeline) GetEosTokenIDs() map[int64]bool       { return p.EosTo
 func (p *Seq2SeqPipeline) GetPadTokenID() int64                 { return p.PadTokenID }
 func (p *Seq2SeqPipeline) GetNumDecoderLayers() int             { return p.NumDecoderLayers }
 func (p *Seq2SeqPipeline) GetVocabSize() int                    { return p.VocabSize }
+func (p *Seq2SeqPipeline) GetNoCacheMode() bool                 { return p.NoCacheMode }
 
 // Interface implementations for backends.Seq2SeqBatchInterface
 

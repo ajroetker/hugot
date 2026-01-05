@@ -29,6 +29,7 @@ type Seq2SeqPipelineInterface interface {
 	GetPadTokenID() int64
 	GetNumDecoderLayers() int
 	GetVocabSize() int
+	GetNoCacheMode() bool
 }
 
 // Seq2SeqBatchInterface defines the interface for seq2seq batch access.
@@ -231,8 +232,12 @@ func LoadSeq2SeqConfig(modelPath string) (*Seq2SeqConfig, error) {
 		EosTokenIDs: make(map[int64]bool),
 	}
 
-	// Decoder start token (typically 0 for T5)
+	// Decoder start token (typically 0 for T5, but T5Gemma2 uses bos_token_id=2)
 	if v, ok := configMap["decoder_start_token_id"].(float64); ok {
+		config.DecoderStartTokenID = int64(v)
+	} else if v, ok := configMap["bos_token_id"].(float64); ok {
+		// Fallback to bos_token_id when decoder_start_token_id is null/None
+		// This is needed for models like T5Gemma2 that don't set decoder_start_token_id
 		config.DecoderStartTokenID = int64(v)
 	}
 
@@ -362,6 +367,145 @@ func findOnnxFile(modelPath string, patterns ...string) (string, error) {
 	}
 
 	return "", fmt.Errorf("no ONNX file found matching patterns %v in %s", patterns, modelPath)
+}
+
+// PKVSplitResult contains the indices for splitting encoder and decoder past key values.
+// This is used by both ORT and GoMLX backends to split PKV outputs from decoder-init.
+type PKVSplitResult struct {
+	EncoderIndices []int // Indices of encoder (cross-attention) PKV in the allPKV slice
+	DecoderIndices []int // Indices of decoder (self-attention) PKV in the allPKV slice
+}
+
+// SplitEncoderDecoderPKVIndices analyzes the decoder-init model's output metadata
+// to determine which PKV outputs are encoder (cross-attention) vs decoder (self-attention).
+// The allPKV slice excludes the first output (logits), so indices are relative to that.
+//
+// decoder-init outputs are typically ordered as:
+//
+//	present.0.decoder.key, present.0.decoder.value,
+//	present.0.encoder.key, present.0.encoder.value, present.1.decoder.key, ...
+//
+// Returns a PKVSplitResult with indices for separating encoder and decoder PKV.
+// Returns empty result if decoderInitModel is nil or has no output metadata.
+func SplitEncoderDecoderPKVIndices(numPKV int, decoderInitModel *Model) PKVSplitResult {
+	result := PKVSplitResult{
+		EncoderIndices: make([]int, 0, numPKV/2),
+		DecoderIndices: make([]int, 0, numPKV/2),
+	}
+
+	// Defensive nil check
+	if decoderInitModel == nil || decoderInitModel.OutputsMeta == nil {
+		return result
+	}
+
+	for i := 0; i < numPKV; i++ {
+		// Output index in model is i+1 (since we skip logits at index 0)
+		outputIdx := i + 1
+		if outputIdx >= len(decoderInitModel.OutputsMeta) {
+			continue
+		}
+
+		outputName := decoderInitModel.OutputsMeta[outputIdx].Name
+		if strings.Contains(outputName, ".encoder.") {
+			result.EncoderIndices = append(result.EncoderIndices, i)
+		} else {
+			result.DecoderIndices = append(result.DecoderIndices, i)
+		}
+	}
+
+	return result
+}
+
+// PKVCombineOrder contains the order for combining encoder and decoder PKV for decoder input.
+type PKVCombineOrder struct {
+	Order []PKVSource // Each element indicates the source for that position
+}
+
+// PKVSource indicates whether a PKV tensor comes from encoder or decoder, and its index.
+type PKVSource struct {
+	IsEncoder bool
+	Index     int
+}
+
+// GetCombinedPKVOrder analyzes the decoder model's input metadata to determine
+// the order for combining encoder and decoder PKV tensors.
+// The decoder expects PKV inputs in a specific order matching its input names.
+//
+// Returns a PKVCombineOrder that maps each output position to its source.
+// Returns empty order if decoderModel is nil or has insufficient input metadata.
+func GetCombinedPKVOrder(decoderModel *Model) PKVCombineOrder {
+	// Defensive nil check
+	if decoderModel == nil || decoderModel.InputsMeta == nil || len(decoderModel.InputsMeta) < 2 {
+		return PKVCombineOrder{Order: []PKVSource{}}
+	}
+
+	// Decoder inputs (after first 2: encoder_attention_mask, input_ids) are PKV tensors
+	numPKVInputs := len(decoderModel.InputsMeta) - 2
+	result := PKVCombineOrder{
+		Order: make([]PKVSource, numPKVInputs),
+	}
+
+	encIdx := 0
+	decIdx := 0
+
+	// Skip the first 2 inputs (encoder_attention_mask, input_ids)
+	for i := 2; i < len(decoderModel.InputsMeta); i++ {
+		inputName := decoderModel.InputsMeta[i].Name
+		resultIdx := i - 2
+
+		if strings.Contains(inputName, ".encoder.") {
+			result.Order[resultIdx] = PKVSource{IsEncoder: true, Index: encIdx}
+			encIdx++
+		} else {
+			result.Order[resultIdx] = PKVSource{IsEncoder: false, Index: decIdx}
+			decIdx++
+		}
+	}
+
+	return result
+}
+
+// ApplyRepetitionPenalty modifies logits in-place to penalize previously generated tokens.
+// For each token that appears in generatedTokens, its logit is divided by the penalty
+// (if the logit is positive) or multiplied by the penalty (if negative).
+// This encourages the model to generate diverse tokens rather than repeating.
+// A penalty of 1.0 has no effect; values > 1.0 penalize repetition.
+func ApplyRepetitionPenalty(logits []float32, generatedTokens []int64, penalty float32, vocabSize int) {
+	if penalty == 1.0 {
+		return
+	}
+
+	// Create a set of tokens to penalize
+	tokenSet := make(map[int64]bool, len(generatedTokens))
+	for _, tok := range generatedTokens {
+		tokenSet[tok] = true
+	}
+
+	// Apply penalty to each token that has been generated
+	for tok := range tokenSet {
+		if tok >= 0 && int(tok) < vocabSize && int(tok) < len(logits) {
+			if logits[tok] > 0 {
+				logits[tok] /= penalty
+			} else {
+				logits[tok] *= penalty
+			}
+		}
+	}
+}
+
+// ApplyRepetitionPenaltyBatch applies repetition penalty to batched logits.
+// logits is a flat array of shape [batchSize, vocabSize].
+// generatedTokens[i] contains the tokens generated so far for batch item i.
+func ApplyRepetitionPenaltyBatch(logits []float32, generatedTokens [][]int64, penalty float32, batchSize, vocabSize int) {
+	if penalty == 1.0 {
+		return
+	}
+
+	for b := 0; b < batchSize; b++ {
+		offset := b * vocabSize
+		batchLogits := logits[offset : offset+vocabSize]
+		ApplyRepetitionPenalty(batchLogits, generatedTokens[b], penalty, vocabSize)
+	}
 }
 
 // findDecoderOnnxFile finds the decoder ONNX file (not the init decoder).

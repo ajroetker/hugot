@@ -1,3 +1,5 @@
+//go:build XLA || ALL
+
 package backends
 
 import (
@@ -91,6 +93,11 @@ func createGoMLXModelBackend(model *Model, options *options.Options) error {
 	modelParsed, err := onnx.Parse(model.OnnxBytes)
 	if err != nil {
 		return err
+	}
+
+	// Apply MaxDynamicBounds if configured for handling data-dependent shapes
+	if options.GoMLXOptions != nil && options.GoMLXOptions.MaxDynamicBounds != nil {
+		modelParsed.WithMaxDynamicBounds(options.GoMLXOptions.MaxDynamicBounds)
 	}
 
 	inputs, outputs := loadInputOutputMetaGoMLX(modelParsed)

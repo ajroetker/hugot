@@ -252,14 +252,8 @@ func (p *GLiNERPipeline) IsGenerative() bool {
 func (p *GLiNERPipeline) Validate() error {
 	var validationErrors []error
 
-	// GLiNER currently only works with ORT backend due to dynamic shape operations
-	// that GoMLX cannot handle (ConstantOfShape nodes that depend on runtime inputs)
-	if p.Runtime == "GO" || p.Runtime == "XLA" {
-		validationErrors = append(validationErrors,
-			fmt.Errorf("GLiNER pipeline currently requires ORT backend (got %s). "+
-				"The model uses dynamic shapes (LSTM hidden states, output shapes) that GoMLX cannot handle. "+
-				"Please use NewORTSession() instead of NewGoSession()", p.Runtime))
-	}
+	// GLiNER now supports Go/XLA backends with dynamic shapes support in GoMLX v0.27+
+	// See: https://github.com/gomlx/gomlx/pull/264
 
 	if p.Model.Tokenizer == nil {
 		validationErrors = append(validationErrors, errors.New("GLiNER pipeline requires a tokenizer"))
