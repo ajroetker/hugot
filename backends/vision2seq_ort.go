@@ -10,6 +10,11 @@ import (
 	ort "github.com/yalue/onnxruntime_go"
 )
 
+// vision2seqTokenSelector is a function type for selecting the next token from logits.
+// Vision2Seq doesn't use repetition penalty (OCR/document tasks don't benefit from it),
+// so this is a simpler signature than the seq2seq tokenSelector.
+type vision2seqTokenSelector func(logits []float32, batchSize, vocabSize int) []int64
+
 // RunVision2SeqEncoderORT runs the vision encoder on preprocessed images using ORT backend.
 func RunVision2SeqEncoder(batch Vision2SeqBatchInterface, model *Model, runtime string) error {
 	if runtime != "ORT" {
@@ -387,14 +392,14 @@ func RunVision2SeqGenerationSampling(batch Vision2SeqBatchInterface, pipeline Vi
 	temperature := pipeline.GetTemperature()
 
 	selector := func(logits []float32, batchSize, vocabSize int) []int64 {
-		return sampleTopP(logits, batchSize, vocabSize, topP, temperature)
+		return sampleTopPVision2Seq(logits, batchSize, vocabSize, topP, temperature)
 	}
 
 	return runVision2SeqGenerationORT(batch, pipeline, selector)
 }
 
 // runVision2SeqGenerationORT is the unified generation loop for ORT backend.
-func runVision2SeqGenerationORT(batch Vision2SeqBatchInterface, pipeline Vision2SeqPipelineInterface, selectTokens tokenSelector) error {
+func runVision2SeqGenerationORT(batch Vision2SeqBatchInterface, pipeline Vision2SeqPipelineInterface, selectTokens vision2seqTokenSelector) error {
 	batchSize := batch.GetSize()
 	maxNewTokens := pipeline.GetMaxNewTokens()
 	eosTokenIDs := pipeline.GetEosTokenIDs()
@@ -1105,6 +1110,15 @@ func argmaxVision2Seq(logits []float32, batchSize, vocabSize int) []int64 {
 	}
 
 	return tokens
+}
+
+// sampleTopPVision2Seq performs nucleus (top-p) sampling with temperature for Vision2Seq.
+// Unlike sampleTopP, this version doesn't use repetition penalty since Vision2Seq
+// (OCR/document tasks) doesn't benefit from it.
+func sampleTopPVision2Seq(logits []float32, batchSize, vocabSize int, topP, temperature float32) []int64 {
+	// Call the full sampleTopP with no repetition penalty (1.0 = no effect)
+	// and empty generated tokens (no penalty to apply)
+	return sampleTopP(logits, batchSize, vocabSize, topP, temperature, 1.0, nil)
 }
 
 // runVision2SeqDecoderInitSplitORT runs the init decoder for split decoder models.
