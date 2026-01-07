@@ -45,4 +45,4 @@ require (
 	k8s.io/klog/v2 v2.130.1 // indirect
 )
 
-replace github.com/knights-analytics/ortgenai => /Users/ajroetker/go/src/github.com/ajroetker/ortgenai
+replace github.com/knights-analytics/ortgenai => github.com/ajroetker/ortgenai v0.0.0-20260102002309-90abcfc27670
