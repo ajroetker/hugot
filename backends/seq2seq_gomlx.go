@@ -1,4 +1,4 @@
-//go:build !ORT && !ALL
+//go:build XLA && !ORT && !ALL
 
 package backends
 
@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"math/rand"
 	"sort"
-	"strings"
 	"time"
 
 	"github.com/gomlx/gomlx/pkg/core/dtypes"
@@ -67,7 +66,10 @@ func RunSeq2SeqEncoder(batch Seq2SeqBatchInterface, model *Model, runtime string
 	}
 	if err := attentionMaskTensor.ToLocal(); err != nil {
 		inputIDsTensor.FinalizeAll()
-		outputs[0].FinalizeAll()
+		attentionMaskTensor.FinalizeAll()
+		for _, out := range outputs {
+			out.FinalizeAll()
+		}
 		return fmt.Errorf("moving attention mask to local: %w", err)
 	}
 
@@ -79,6 +81,7 @@ func RunSeq2SeqEncoder(batch Seq2SeqBatchInterface, model *Model, runtime string
 	batch.SetDestroyEncoder(func() error {
 		var errs []error
 		errs = append(errs, inputIDsTensor.FinalizeAll())
+		errs = append(errs, attentionMaskTensor.FinalizeAll())
 		for _, out := range outputs {
 			errs = append(errs, out.FinalizeAll())
 		}
@@ -116,6 +119,8 @@ func runSeq2SeqGenerationGoMLX(batch Seq2SeqBatchInterface, pipeline Seq2SeqPipe
 	eosTokenIDs := pipeline.GetEosTokenIDs()
 	topP := pipeline.GetTopP()
 	temperature := pipeline.GetTemperature()
+	repetitionPenalty := pipeline.GetRepetitionPenalty()
+	vocabSize := pipeline.GetVocabSize()
 
 	// Initialize generation state
 	generatedTokens := make([][]int64, batchSize)
@@ -125,9 +130,17 @@ func runSeq2SeqGenerationGoMLX(batch Seq2SeqBatchInterface, pipeline Seq2SeqPipe
 	finished := make([]bool, batchSize)
 	finishedCount := 0
 
-	// Get encoder outputs
-	encoderHiddenStates := batch.GetEncoderHiddenStates().(*tensors.Tensor)
-	encoderAttentionMask := batch.GetEncoderAttentionMask().(*tensors.Tensor)
+	// Get encoder outputs with type safety
+	encoderHiddenStatesAny := batch.GetEncoderHiddenStates()
+	encoderHiddenStates, ok := encoderHiddenStatesAny.(*tensors.Tensor)
+	if !ok {
+		return fmt.Errorf("encoder hidden states has wrong type: got %T, expected *tensors.Tensor", encoderHiddenStatesAny)
+	}
+	encoderAttentionMaskAny := batch.GetEncoderAttentionMask()
+	encoderAttentionMask, ok := encoderAttentionMaskAny.(*tensors.Tensor)
+	if !ok {
+		return fmt.Errorf("encoder attention mask has wrong type: got %T, expected *tensors.Tensor", encoderAttentionMaskAny)
+	}
 
 	// Initialize decoder input with start token
 	currentIDs := make([]int64, batchSize)
@@ -140,6 +153,20 @@ func runSeq2SeqGenerationGoMLX(batch Seq2SeqBatchInterface, pipeline Seq2SeqPipe
 	// decoderPKV gets updated each step (self-attention KV)
 	var encoderPKV []*tensors.Tensor
 	var decoderPKV []*tensors.Tensor
+
+	// cleanupPKV is a helper to clean up PKV tensors on error
+	cleanupPKV := func() {
+		for _, kv := range encoderPKV {
+			if kv != nil {
+				kv.FinalizeAll()
+			}
+		}
+		for _, kv := range decoderPKV {
+			if kv != nil {
+				kv.FinalizeAll()
+			}
+		}
+	}
 
 	// Generation loop
 	for step := 0; step < maxNewTokens && finishedCount < batchSize; step++ {
@@ -169,7 +196,12 @@ func runSeq2SeqGenerationGoMLX(batch Seq2SeqBatchInterface, pipeline Seq2SeqPipe
 			// Subsequent steps: use decoder with past_key_values
 			// Input order: encoder_attention_mask, input_ids, past_key_values...
 			// PKV order: decoder.key, decoder.value, encoder.key, encoder.value (per layer)
-			combinedPKV := combineEncoderDecoderPKVGoMLX(encoderPKV, decoderPKV, decoderModel)
+			combinedPKV, combineErr := combineEncoderDecoderPKVGoMLX(encoderPKV, decoderPKV, decoderModel)
+			if combineErr != nil {
+				inputTensor.FinalizeAll()
+				cleanupPKV()
+				return fmt.Errorf("combining PKV at step %d: %w", step, combineErr)
+			}
 			inputs := []any{encoderAttentionMask, inputTensor}
 			for _, kv := range combinedPKV {
 				inputs = append(inputs, kv)
@@ -179,11 +211,13 @@ func runSeq2SeqGenerationGoMLX(batch Seq2SeqBatchInterface, pipeline Seq2SeqPipe
 
 		if err != nil {
 			inputTensor.FinalizeAll()
+			cleanupPKV()
 			return fmt.Errorf("decoder step %d failed: %w", step, err)
 		}
 
 		if len(outputs) < 1 {
 			inputTensor.FinalizeAll()
+			cleanupPKV()
 			return fmt.Errorf("decoder step %d returned no outputs", step)
 		}
 
@@ -191,6 +225,11 @@ func runSeq2SeqGenerationGoMLX(batch Seq2SeqBatchInterface, pipeline Seq2SeqPipe
 		logits := outputs[0]
 		if err := logits.ToLocal(); err != nil {
 			inputTensor.FinalizeAll()
+			// Clean up logits and all other outputs from this step
+			for _, out := range outputs {
+				out.FinalizeAll()
+			}
+			cleanupPKV()
 			return fmt.Errorf("moving logits to local at step %d: %w", step, err)
 		}
 
@@ -201,6 +240,11 @@ func runSeq2SeqGenerationGoMLX(batch Seq2SeqBatchInterface, pipeline Seq2SeqPipe
 				if err := outputs[i].ToLocal(); err != nil {
 					inputTensor.FinalizeAll()
 					logits.FinalizeAll()
+					// Clean up all remaining outputs (both moved and not moved)
+					for j := 1; j < len(outputs); j++ {
+						outputs[j].FinalizeAll()
+					}
+					cleanupPKV()
 					return fmt.Errorf("moving KV cache tensor %d to local at step %d: %w", i-1, step, err)
 				}
 			}
@@ -227,13 +271,14 @@ func runSeq2SeqGenerationGoMLX(batch Seq2SeqBatchInterface, pipeline Seq2SeqPipe
 		// Get next tokens from logits
 		var nextTokens []int64
 		if doSample {
-			nextTokens, err = sampleFromLogitsGoMLX(logits, topP, temperature)
+			nextTokens, err = sampleFromLogitsGoMLX(logits, topP, temperature, repetitionPenalty, generatedTokens, vocabSize)
 		} else {
-			nextTokens, err = argmaxFromLogitsGoMLX(logits)
+			nextTokens, err = argmaxFromLogitsGoMLX(logits, repetitionPenalty, generatedTokens, vocabSize)
 		}
 		if err != nil {
 			inputTensor.FinalizeAll()
 			logits.FinalizeAll()
+			cleanupPKV()
 			return fmt.Errorf("failed to get next tokens at step %d: %w", step, err)
 		}
 
@@ -285,7 +330,8 @@ func runSeq2SeqGenerationGoMLX(batch Seq2SeqBatchInterface, pipeline Seq2SeqPipe
 }
 
 // argmaxFromLogitsGoMLX extracts the argmax token ID from logits for each batch item.
-func argmaxFromLogitsGoMLX(logits *tensors.Tensor) ([]int64, error) {
+// Applies repetition penalty before selecting the maximum if penalty != 1.0.
+func argmaxFromLogitsGoMLX(logits *tensors.Tensor, repetitionPenalty float32, generatedTokens [][]int64, vocabSizeHint int) ([]int64, error) {
 	shape := logits.Shape()
 	if shape.Rank() < 2 || shape.Rank() > 3 {
 		return nil, fmt.Errorf("expected logits rank 2 or 3, got %d", shape.Rank())
@@ -325,11 +371,17 @@ func argmaxFromLogitsGoMLX(logits *tensors.Tensor) ([]int64, error) {
 			return nil, fmt.Errorf("logits buffer too small: need %d elements, have %d", offset+vocabSize, len(logitsData))
 		}
 
+		// Apply repetition penalty for this batch item
+		batchLogits := logitsData[offset : offset+vocabSize]
+		if repetitionPenalty != 1.0 && batch < len(generatedTokens) {
+			ApplyRepetitionPenalty(batchLogits, generatedTokens[batch], repetitionPenalty, vocabSize)
+		}
+
 		maxIdx := 0
-		maxVal := logitsData[offset]
+		maxVal := batchLogits[0]
 		for v := 1; v < vocabSize; v++ {
-			if logitsData[offset+v] > maxVal {
-				maxVal = logitsData[offset+v]
+			if batchLogits[v] > maxVal {
+				maxVal = batchLogits[v]
 				maxIdx = v
 			}
 		}
@@ -341,7 +393,8 @@ func argmaxFromLogitsGoMLX(logits *tensors.Tensor) ([]int64, error) {
 
 // sampleFromLogitsGoMLX samples token IDs from logits with temperature and top-p.
 // Creates a thread-local RNG seeded with current time for non-deterministic sampling.
-func sampleFromLogitsGoMLX(logits *tensors.Tensor, topP, temperature float32) ([]int64, error) {
+// Applies repetition penalty before sampling if penalty != 1.0.
+func sampleFromLogitsGoMLX(logits *tensors.Tensor, topP, temperature, repetitionPenalty float32, generatedTokens [][]int64, vocabSizeHint int) ([]int64, error) {
 	shape := logits.Shape()
 	if shape.Rank() < 2 || shape.Rank() > 3 {
 		return nil, fmt.Errorf("expected logits rank 2 or 3, got %d", shape.Rank())
@@ -385,6 +438,11 @@ func sampleFromLogitsGoMLX(logits *tensors.Tensor, topP, temperature float32) ([
 
 		batchLogits := make([]float32, vocabSize)
 		copy(batchLogits, logitsData[offset:offset+vocabSize])
+
+		// Apply repetition penalty before temperature scaling
+		if repetitionPenalty != 1.0 && batch < len(generatedTokens) {
+			ApplyRepetitionPenalty(batchLogits, generatedTokens[batch], repetitionPenalty, vocabSize)
+		}
 
 		// Apply temperature
 		if temperature != 1.0 && temperature > 0 {
@@ -447,11 +505,12 @@ func sampleTopPGoMLX(probs []float32, topP float32, rng *rand.Rand) int {
 	var cumProb float32
 	for _, ip := range nucleus {
 		cumProb += ip.prob
-		if r <= cumProb {
+		if r < cumProb {
 			return ip.index
 		}
 	}
 
+	// Fallback to first token in nucleus (handles edge case when r equals cumProb exactly)
 	return nucleus[0].index
 }
 
@@ -469,52 +528,48 @@ func NewSeq2SeqRNG(seed int64) *rand.Rand {
 // - encoderPKV contains cross-attention KV (constant throughout generation)
 // - decoderPKV contains self-attention KV (updated each step)
 func splitEncoderDecoderPKVGoMLX(allPKV []*tensors.Tensor, decoderInitModel *Model) (encoderPKV, decoderPKV []*tensors.Tensor) {
-	// Analyze output names to determine which are encoder vs decoder PKV
-	// Output names from decoder-init are like: present.0.decoder.key, present.0.decoder.value,
-	// present.0.encoder.key, present.0.encoder.value, ...
-	for i, pkv := range allPKV {
-		// Output index in model is i+1 (since we skipped logits at index 0)
-		outputIdx := i + 1
-		if outputIdx >= len(decoderInitModel.OutputsMeta) {
-			continue
-		}
-		outputName := decoderInitModel.OutputsMeta[outputIdx].Name
-		if strings.Contains(outputName, ".encoder.") {
-			encoderPKV = append(encoderPKV, pkv)
-		} else {
-			decoderPKV = append(decoderPKV, pkv)
-		}
+	// Use shared logic to get indices, then apply to GoMLX tensors
+	split := SplitEncoderDecoderPKVIndices(len(allPKV), decoderInitModel)
+
+	encoderPKV = make([]*tensors.Tensor, len(split.EncoderIndices))
+	for i, idx := range split.EncoderIndices {
+		encoderPKV[i] = allPKV[idx]
 	}
+
+	decoderPKV = make([]*tensors.Tensor, len(split.DecoderIndices))
+	for i, idx := range split.DecoderIndices {
+		decoderPKV[i] = allPKV[idx]
+	}
+
 	return encoderPKV, decoderPKV
 }
 
 // combineEncoderDecoderPKVGoMLX combines encoder and decoder PKV in the order expected by decoder input.
 // Decoder expects: past_key_values.0.decoder.key, past_key_values.0.decoder.value,
 // past_key_values.0.encoder.key, past_key_values.0.encoder.value, ...
-func combineEncoderDecoderPKVGoMLX(encoderPKV, decoderPKV []*tensors.Tensor, decoderModel *Model) []*tensors.Tensor {
-	// Number of PKV inputs = total inputs - 2 (encoder_attention_mask, input_ids)
-	numPKVInputs := len(decoderModel.InputsMeta) - 2
-	result := make([]*tensors.Tensor, numPKVInputs)
+// Returns (result, error) where error is non-nil if any PKV index is out of bounds.
+func combineEncoderDecoderPKVGoMLX(encoderPKV, decoderPKV []*tensors.Tensor, decoderModel *Model) ([]*tensors.Tensor, error) {
+	if decoderModel == nil {
+		return nil, fmt.Errorf("decoder model is nil")
+	}
 
-	encIdx := 0
-	decIdx := 0
+	// Use shared logic to get the order, then apply to GoMLX tensors
+	order := GetCombinedPKVOrder(decoderModel)
+	result := make([]*tensors.Tensor, len(order.Order))
 
-	// Iterate through decoder input metadata to determine the correct order
-	for i := 2; i < len(decoderModel.InputsMeta); i++ {
-		inputName := decoderModel.InputsMeta[i].Name
-		resultIdx := i - 2
-		if strings.Contains(inputName, ".encoder.") {
-			if encIdx < len(encoderPKV) {
-				result[resultIdx] = encoderPKV[encIdx]
-				encIdx++
+	for i, source := range order.Order {
+		if source.IsEncoder {
+			if source.Index >= len(encoderPKV) {
+				return nil, fmt.Errorf("encoder PKV index %d out of bounds (have %d)", source.Index, len(encoderPKV))
 			}
+			result[i] = encoderPKV[source.Index]
 		} else {
-			if decIdx < len(decoderPKV) {
-				result[resultIdx] = decoderPKV[decIdx]
-				decIdx++
+			if source.Index >= len(decoderPKV) {
+				return nil, fmt.Errorf("decoder PKV index %d out of bounds (have %d)", source.Index, len(decoderPKV))
 			}
+			result[i] = decoderPKV[source.Index]
 		}
 	}
 
-	return result
+	return result, nil
 }

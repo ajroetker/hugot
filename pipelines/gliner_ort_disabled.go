@@ -1,4 +1,4 @@
-//go:build !ORT && !ALL
+//go:build !ORT && !XLA && !ALL
 
 package pipelines
 
@@ -6,12 +6,20 @@ import (
 	"github.com/knights-analytics/hugot/backends"
 )
 
+// ORT stubs - not available when using pure Go runtime
 func createGLiNERTensorsORT(batch *GLiNERBatch, model *backends.Model) error {
-	// ORT not available - this will never be called when using GO/XLA runtime
 	return nil
 }
 
 func runGLiNERSessionOnBatchORT(batch *GLiNERBatch, p *backends.BasePipeline) error {
-	// ORT not available - this will never be called when using GO/XLA runtime
+	return nil
+}
+
+// GoMLX stubs - not available when using pure Go runtime
+func createGLiNERTensorsGoMLX(batch *GLiNERBatch, model *backends.Model) error {
+	return nil
+}
+
+func runGLiNERSessionOnBatchGoMLX(batch *GLiNERBatch, p *backends.BasePipeline) error {
 	return nil
 }

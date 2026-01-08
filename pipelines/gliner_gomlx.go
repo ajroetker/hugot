@@ -1,4 +1,4 @@
-//go:build !ORT && !ALL
+//go:build XLA && !ORT && !ALL
 
 package pipelines
 
@@ -11,10 +11,9 @@ import (
 	"github.com/knights-analytics/hugot/backends"
 )
 
-// Note: GLiNER GoMLX implementation exists but is not fully functional due to
-// dynamic shape operations (LSTM hidden states, ConstantOfShape nodes) that
-// GoMLX cannot handle. The code is kept for future development when GoMLX
-// gains dynamic shape support. For production use, use ORT backend.
+// GLiNER GoMLX implementation using pure Go inference.
+// Dynamic shapes are now supported via GoMLX v0.27+ symbolic dimensions.
+// See: https://github.com/gomlx/gomlx/pull/264
 
 // createGLiNERTensorsGoMLX creates ALL tensors needed for GLiNER inference using GoMLX
 func createGLiNERTensorsGoMLX(batch *GLiNERBatch, model *backends.Model) error {
